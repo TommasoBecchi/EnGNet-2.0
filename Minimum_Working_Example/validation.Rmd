@@ -1,0 +1,127 @@
+---
+title: "Validation"
+author: "Tommaso Becchi"
+date: "19/2/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library("GEOquery")
+library(dplyr)
+library("pheatmap")
+library("ggplot2")
+library("limma")
+library("edgeR")
+library("psych")
+library("igraph")
+library("knitr")
+library("pROC")
+```
+
+
+
+### 6. GENE NETWORK VALIDATION
+
+```{r}
+string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+string<-string[string$coexpression>0,c(1,2,6)]
+head(string)
+dim(string)
+
+```
+
+```{r}
+comparison
+```
+This table shows the best thresholds selected in the previous paragraphs. Using these thresholds I create the new dataframes to use for the validation.
+
+```{r}
+pearson_l<-final_data_p[abs(final_data_p$cor)>=0.6,]
+pearson_nl<-final_data_NL_p[abs(final_data_NL_p$cor)>=0.75,]
+kendall_l<-final_data_k[abs(final_data_k$cor)>=0.53,]
+kendall_nl<-final_data_NL_k[abs(final_data_NL_k$cor)>=0.55,]
+spearman_l<-final_data_s[abs(final_data_s$cor)>=0.64,]
+spearman_nl<-final_data_NL_s[abs(final_data_NL_s$cor)>=0.55,]
+
+head(pearson_l)
+```
+
+#### 6.1 IDs conversion
+
+STRING dataframe uses ENSP identifier but my dataframes have the ENSG ones. This is a problem because the names need to be of the same type to verify which interactions are present in both networks.
+
+```{r}
+#Create a vector with all the ENGS identifiers in my database
+gen_id<-c(pearson_l[,1],pearson_l[,2])
+#Remove all the duplicates
+gen_un<-unique(gen_id)
+length(gen_un)
+```
+In my dataframe there are 588 different ENSG genes
+
+```{r}
+#Convert ENGS in ENSP using Biomart
+biomart <- getBM(attributes=c('ensembl_gene_id',"ensembl_peptide_id"), filters = 'ensembl_gene_id', values =gen_un, mart = hsmart)
+dim(biomart)
+
+```
+Biomart contains more than 586 identifiers because to each ENSG correspond more than one ENSP. This is a problem because I want a unique ENSG-ENSP conversion.
+Next steps aim to detect which ENSP identifiers I have to use.
+
+```{r}
+#Remove "9606." from each STRING identifier
+string$p1<-substr(string$protein1,6,20)
+string$p2<-substr(string$protein2,6,20)
+
+#Detect which of my 2912 ENSP identifiers are present in STRING
+try<-biomart$ensembl_peptide_id %in% (string$p2)
+summary(try)
+```
+The 513 ENSP identifiers that are present both in my BIOMART table and in STRING are the ones that are useful for further analyses.
+
+```{r}
+#Create a "conversion table" usign only the ENSP identifier that are present in both BIOMART and  STRING dataframes"
+both<-biomart[try==T,]
+head(both)
+```
+```{r}
+# These 2 "for cycles" aim to add the colums with ENSP identifiers to pearson_l. If ENSG identifiers are present in BOTH they have a correspondent ENSP in STRING and I use BOTH to convert them. If they are not present in BOTH, they do not have a correspondent ENSP in STRING and i add a " " in ENSP column
+
+l<-c()
+for (k in pearson_l$row){
+  if (k %in% both$ensembl_gene_id){
+    pep<-both[both$ensembl_gene_id==k,2]
+    l<-c(l,pep)
+  }
+  else{
+    l<-c(l,"")
+  }
+}
+pearson_l$p1<-l
+
+l<-c()
+for (k in pearson_l$column){
+  if (k %in% both$ensembl_gene_id){
+    pep<-both[both$ensembl_gene_id==k,2]
+    l<-c(l,pep)
+  }
+  else{
+    l<-c(l,"")
+  }
+}
+pearson_l$p2<-l
+
+head(pearson_l)
+
+```
+#### 6.2 ROC graph
+```{r}
+pearson_l$check <- ifelse(is.na(match(paste0(pearson_l$p1, pearson_l$p2),paste0(string$p1, string$p2))), FALSE, TRUE)
+summary(pearson_l$check)
+
+
+plot.roc(pearson_l$check,pearson_l$cor,percent=T)

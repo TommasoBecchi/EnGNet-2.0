@@ -1,0 +1,805 @@
+---
+title: "Basic construction of a MWE"
+author: "Tommaso Becchi"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+The selected GEO series is **GSE157194**
+
+This dataset contains data obtained from 57 patients with moderate to severe *atopic dermatitis (AD)*. 
+Intrapersonal lesional (AL) and non-lesional (AN) skin biopsies (4 mm) were collected from 57 patients prior to the initiation of a systemic therapy. Follow-up biopsies 3 months after the initiation of systemic treatment were available.
+My focus is on the differential gene expression for AL e AN samples measured before the start of therapy  
+
+### 0. IMPORT LIBRARIES
+```{r}
+library("GEOquery")
+library(dplyr)
+library("pheatmap")
+library("ggplot2")
+library("limma")
+library("edgeR")
+library("psych")
+library("igraph")
+library("knitr")
+library("pROC")
+```
+
+
+
+### 1. IMPORT THE DATASET
+#### 1.1 Series Matrix 
+```{r}
+info=getGEO(filename="GSE157194_series_matrix.txt")
+info
+```
+#### 1.2 Count table
+```{r}
+gene_expression=read.delim(file="Raw_gene_counts_matrix.txt",row.names = 1)
+dim(gene_expression)
+head(gene_expression,n=c(6,4))
+```
+#### 1.3 Extract useful information from Series Matrix 
+```{r}
+sampleinfo<-pData(info)
+#I select only the sample measured before the start of therapy
+gene_expression<-gene_expression[,1:111]
+sampleinfo<-sampleinfo[1:111,]
+#From sampleinfo I extract the field which refers to the AL/AN condition
+sampleinfo2<-select(sampleinfo, source_name_ch1 )
+rownames(sampleinfo2)<-colnames(gene_expression)
+colnames(sampleinfo2)<-c("group")
+#I change the varibles name to better visualize the groups
+sampleinfo2$group[which(sampleinfo2$group == "m0_AL") ] <- "Lesional"
+sampleinfo2$group[which(sampleinfo2$group == "m0_AN") ] <- "Non_Lesional"
+head(sampleinfo2)
+```
+
+### 2. DATA PRE-PROCESSING
+#### 2.1 Exploratory analyses
+##### 2.1.1 Hierarchical clustering
+```{r}
+corMatrix<-cor(gene_expression, use="c")
+dim(corMatrix)
+pheatmap(corMatrix,annotation_col=sampleinfo2,show_rownames=FALSE,show_colnames=FALSE,annotation_legend=TRUE )
+```
+
+##### 2.1.2 PCA
+```{r}
+pca<-prcomp(t(gene_expression))
+cbind(sampleinfo2,pca$x) %>%
+ggplot(aes(x = PC1, y=PC2, col=group)) + geom_point()
+```
+
+##### 2.1.3 MDS plot
+```{r}
+newc<-factor(sampleinfo2$group)
+sampleinfo2$group<-newc
+colors<-c("red","blue")[sampleinfo2$group]
+plotMDS(gene_expression,col=colors, pch=19) 
+legend("topleft",fill=c("red","blue"),legend=levels(sampleinfo2$group),cex=0.8)
+```
+
+MDS plot and PCA plot are very similar and they show that *Non_Lesional* samples are quite grouped while *Lesional* samples are more dispersed.
+
+
+#### 2.2 Removing genes that are lowly expressed
+```{r}
+x<-DGEList(gene_expression)
+dim(x)
+cpm<-cpm(x)
+
+library(RColorBrewer)
+nsamples <- ncol(x)
+col <- brewer.pal(nsamples, "Paired")
+lcpm <- cpm(x, log=TRUE)
+par(mfrow=c(1,2))
+plot(density(lcpm[,1]), lwd=2, ylim=c(0,0.5), las=2, main="", xlab="")
+title(main="A. Raw data", xlab="Log-cpm")
+for (i in 2:nsamples){
+den <- density(lcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+#The filterByExpr function provides an automatic way to filter genes that are lowly expressed
+keep.exprs <- filterByExpr(x, group=sampleinfo2$group)
+x <- x[keep.exprs,, keep.lib.sizes=FALSE]
+dim(x)
+lcpm <- cpm(x, log=TRUE)
+plot(density(lcpm[,1]), lwd=2, ylim=c(0,0.5), las=2, main="", xlab="")
+title(main="B. Filtered data", xlab="Log-cpm")
+for (i in 2:nsamples){
+den <- density(lcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+```
+
+*Raw data* graph shows that there are many poorly expressed genes (*log density* lower than 0). This is confirmed by comparing the datasets before and after using the function *filterByExpr*: 43223 total genes vs 17301 final genes.
+
+#### 2.3 Normalising gene expression distributions
+```{r}
+par(mfrow=c(1,2))
+lcpm <- cpm(x, log=TRUE)
+boxplot(lcpm[,20:40], las=2, main="")
+#Normalisation by the method of trimmed mean of M-values (TMM)
+x2 <- calcNormFactors(x, method="TMM")  
+lcpm <- cpm(x2, log=TRUE)
+boxplot(lcpm[,20:40], las=2, main="")
+```
+
+The two graphs show how the distribution of 20 samples varies before and after normalization. It is possible to observe that after normalization the differences between the samples distributions are smaller. 
+
+#### 2.4 Differential gene expression analyses
+```{r}
+design <- model.matrix(~ 0 + sampleinfo2$group)
+#invert lesional and non-lesional!!!!
+colnames(design) <- c("Lesional","Non_Lesional")
+head(design)
+cont.matrix <- makeContrasts(LesVsNonLes= Lesional - Non_Lesional,levels=design)
+cont.matrix
+par(mfrow=c(1,2))
+#Voom converts raw counts to log-CPM values by automatically extracting library sizes and normalisation factors from x itself
+v <- voom(x2, design, plot=TRUE)
+vfit <- lmFit(v, design)
+##change the name!!!
+vfit <- contrasts.fit(vfit, contrasts=cont.matrix)
+efit <- eBayes(vfit)
+plotSA(efit, main="Final model: Mean-variance trend")
+```
+
+Means (x-axis) and variances (y-axis) of each gene are plotted to show the dependence between the two before voom is applied to the data (left panel) and how the trend is removed after voom precision weights are applied to the data (right panel)
+
+```{r}
+summary(decideTests(efit))
+result <- decideTests(efit)
+vennDiagram(result,  include=c('up', 'down'))
+```
+
+8936 DEGs (4424 down-regulated + 4512 up-regulated) are identified using only *adjusted p-value* (threshold=0.05) as cutoff. 
+For a stricter definition on significance, one may require log-fold-changes (log-FCs) to be above a minimum value. The *treat* method can be used to calculate p-values from empirical Bayes moderated t-statistics with a minimum log-FC requirement. 
+
+
+```{r}
+tfit <- treat(vfit, lfc=0.5)
+dt <- decideTests(tfit)
+summary(dt)
+```
+Using both *adjusted p-value* (threshold=0.05) and *log-fold-changes* (abs.value >0.5) the number of DEGs is reduced to 680 (182 down-regulated + 498 up-regulated). 
+
+```{r}
+results<-data.frame(dt)
+results$id<-rownames(results)
+DEGs<-results[results$LesVsNonLes!=0,]
+```
+
+
+```{r}
+les.vs.nles <- topTable(efit,coef=1, n=Inf )
+head(les.vs.nles)
+
+```
+
+The following graph shows the *adjusted p-value vs log-fold-changes* distribution of the genes and it highligths the ones that are identified as DEGS.
+```{r}
+les.vs.nles %>% 
+  mutate(Significant = adj.P.Val < 0.05 & abs(logFC) > 1) %>% 
+  ggplot(aes(x = logFC, y = adj.P.Val, col=Significant)) + geom_point()+geom_hline(aes(yintercept=0.05), colour="#990000", linetype="dashed")+ geom_vline(aes(xintercept=1), colour="#990000", linetype="dashed")+geom_vline(aes(xintercept=-1), colour="#990000", linetype="dashed")
+```
+
+Since most of the genes have high p-value, highlighting only the upper part of the graph allows to better observe the DEGs distribution.
+
+```{r}
+les.vs.nles%>% 
+  mutate(Significant = adj.P.Val < 0.05 & abs(logFC) > 1) %>% 
+  ggplot(aes(x = logFC, y = adj.P.Val, col=Significant)) + geom_point()+geom_hline(aes(yintercept=0.05), colour="#990000", linetype="dashed")+ geom_vline(aes(xintercept=1), colour="#990000", linetype="dashed")+geom_vline(aes(xintercept=-1), colour="#990000", linetype="dashed")+ylim(0,0.1)
+
+```
+
+
+```{r}
+library("EnhancedVolcano")
+EnhancedVolcano(topTable(efit,coef=1, n='Inf'),
+                lab = NA,
+                x = 'logFC',
+                y = 'adj.P.Val',
+                axisLabSize=30,
+                legendLabSize=20
+)
+```
+
+### 3. GENE NETWORK RECONSTRUCTION
+
+#### 3.1 Conditional Quartile Normalization
+```{r}
+#Create two dataframe with raw counts, one for DEGs in lesional samples and one for DEGs in non-lesional samples
+gene_final<-data.frame(x$counts)
+count_AL<-gene_final[rownames(gene_final)%in% DEGs$id,sampleinfo2$group=="Lesional"]
+dim(count_AL)
+count_NL<-gene_final[rownames(gene_final)%in% DEGs$id,sampleinfo2$group=="Non_Lesional"]
+dim(count_NL)
+#Since lesional dataframe contains more samples than non.lesional one, I remove 3 columns in lesional dataframe
+count_AL<-count_AL[,1:54]
+```
+```{r}
+library("biomaRt")
+#Create a Biomart object with start/end position and GC content
+hsmart <- useMart(dataset = "hsapiens_gene_ensembl", biomart = "ensembl")
+biomart2 <- getBM(attributes=c('ensembl_gene_id','start_position','end_position', 'percentage_gene_gc_content'), filters = 'ensembl_gene_id', values =rownames(count_AL), mart = hsmart)   
+#Add the length column
+biomart2$length<-biomart2$end_position-biomart2$start_position
+#Create an objecy with only length and gc content for each DEG
+gene_length_gc<-biomart2[,c(1,4,5)]
+dim(gene_length_gc)
+```
+*gene_length_gc* has 2 elements less than DEGs. Using *getBM* function it is possible to loose some genes. Then I have to remove these 2 elements from DEGs dataframes
+
+```{r}
+both <-rownames (count_AL)%in% gene_length_gc$ensembl_gene_id
+count_AL<-count_AL[both==TRUE,]
+dim(count_AL)
+```
+```{r}
+both <-rownames (count_NL)%in% gene_length_gc$ensembl_gene_id
+count_NL<-count_NL[both==TRUE,]
+dim(count_NL)
+
+```
+
+
+```{r}
+library("cqn")
+#Conditional quantile normalization for lesional samples
+cqn.subset<-cqn(count_AL,lengths=gene_length_gc$length,x=gene_length_gc$percentage_gene_gc_content)
+normalized_count_AL<-data.frame(cqn.subset$y+cqn.subset$offset)
+
+#Conditional quantile normalization for non-lesional samples
+cqn.subset<-cqn(count_NL,lengths=gene_length_gc$length,x=gene_length_gc$percentage_gene_gc_content)
+normalized_count_NL<-data.frame(cqn.subset$y+cqn.subset$offset)
+```
+```{r}
+#Observe the difference before and after qcn
+par(mfrow=c(1,2))
+lcpm2 <- cpm(count_AL, log=TRUE)
+boxplot(lcpm2[,20:40], las=2, main="")
+boxplot(normalized_count_AL[,20:40])
+```
+
+
+#### 3.2 Correlation matrix (pearson, kendall, spearman)
+
+```{r}
+sign_L<-c()
+sign_NL<-c()
+
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+  )
+}
+```
+
+##### 3.2.1 Pearson
+```{r}
+#Create the correlation matrix with corr.test funcion
+correlation_AL<-corr.test(t(normalized_count_AL),method="pearson",adjust="BH",ci=FALSE)
+cormat<-correlation_AL$r
+pmat<-correlation_AL$p
+cormat_flat<-flattenCorrMatrix(cormat,pmat)
+
+```
+```{r}
+correlation_NL<-corr.test(t(normalized_count_NL),method="pearson",adjust="BH",ci=FALSE)
+cormat<-correlation_NL$r
+pmat<-correlation_NL$p
+cormat_flat_NL<-flattenCorrMatrix(cormat,pmat)
+```
+
+
+```{r}
+#Select only the correlations with a p-value lower than 0.05
+significant<-cormat_flat$p<0.05
+summary(significant)
+final_data_p<-cormat_flat[significant==TRUE,]
+sign_L<-c(sign_L,as.integer(dim(final_data_p)[1]))
+```
+```{r}
+significant_NL<-cormat_flat_NL$p<0.05
+summary(significant_NL)
+final_data_NL_p<-cormat_flat_NL[significant_NL==TRUE,]
+sign_NL<-c(sign_NL,as.integer(dim(final_data_NL_p)[1]))
+```
+
+##### 3.2.2 Kendall
+```{r}
+correlation_AL<-corr.test(t(normalized_count_AL),method="kendall",adjust="BH",ci=FALSE)
+cormat<-correlation_AL$r
+pmat<-correlation_AL$p
+cormat_flat<-flattenCorrMatrix(cormat,pmat)
+
+significant<-cormat_flat$p<0.05
+summary(significant)
+final_data_k<-cormat_flat[significant==TRUE,]
+sign_L<-c(sign_L,as.integer(dim(final_data_k)[1]))
+```
+
+```{r}
+correlation_NL<-corr.test(t(normalized_count_NL),method="kendall",adjust="BH",ci=FALSE)
+cormat<-correlation_NL$r
+pmat<-correlation_NL$p
+cormat_flat_NL<-flattenCorrMatrix(cormat,pmat)
+
+significant<-cormat_flat_NL$p<0.05
+summary(significant)
+final_data_NL_k<-cormat_flat[significant==TRUE,]
+sign_NL<-c(sign_NL,as.integer(dim(final_data_NL_k)[1]))
+```
+
+
+##### 3.2.3 Spearman
+
+```{r}
+correlation_AL<-corr.test(t(normalized_count_AL),method="spearman",adjust="BH",ci=FALSE)
+cormat<-correlation_AL$r
+pmat<-correlation_AL$p
+cormat_flat<-flattenCorrMatrix(cormat,pmat)
+
+significant<-cormat_flat$p<0.05
+summary(significant)
+final_data_s<-cormat_flat[significant==TRUE,]
+sign_L<-c(sign_L,as.integer(dim(final_data_s)[1]))
+```
+
+```{r}
+correlation_NL<-corr.test(t(normalized_count_NL),method="spearman",adjust="BH",ci=FALSE)
+cormat<-correlation_NL$r
+pmat<-correlation_NL$p
+cormat_flat_NL<-flattenCorrMatrix(cormat,pmat)
+
+significant<-cormat_flat_NL$p<0.05
+summary(significant)
+final_data_NL_s<-cormat_flat_NL[significant==TRUE,]
+sign_NL<-c(sign_NL,as.integer(dim(final_data_NL_s)[1]))
+```
+
+
+
+
+```{r}
+comparison<-data.frame(lesional=sign_L,non_lesional=sign_NL)
+rownames(comparison)<-c("pearson","kendall","spearman")
+comparison
+```
+
+This table sumarises the number of significant correlation (p-value<0.05) identified by each method. It is immediately evident that *kendall* identifes a much smaller number than *pearson* and *spearman*
+
+#### 3.3 Best Thresholds
+
+It is necessary to study which *correlation* threshold allows to obtain a graph whose distribution of degrees most respects a power-law distribution 
+
+```{r eval=FALSE, include=FALSE}
+best_L<-c()
+best_NL<-c()
+```
+
+
+##### 3.3.1 Pearson
+```{r eval=FALSE, include=FALSE}
+thr<-c()
+score<-c()
+for (i in seq (0,0.9,0.01)){
+  data<-final_data_p[abs(final_data_p$cor)>=i,]
+  g<-graph_from_data_frame(data,directed=F)
+  dist<-degree.distribution(g)
+  power_law<-fit_power_law(dist)
+  thr<-c(thr,i)
+  #K.stat describes how better the distribution fits a power-law. Smaller scores denote better fit.
+  score<-c(score,power_law$KS.stat)
+}
+result_L=data.frame(threshold=thr,score=score)
+best<-min(score)
+best_L<-c(best_L,result_L[result_L$score==best,]$threshold)
+```
+```{r eval=FALSE, include=FALSE}
+thr<-c()
+score<-c()
+for (i in seq (0,0.9,0.01)){
+  data<-final_data_NL_p[abs(final_data_NL_p$cor)>=i,]
+  g<-graph_from_data_frame(data,directed=F)
+  dist<-degree.distribution(g)
+  power_law<-fit_power_law(dist)
+  thr<-c(thr,i)
+  score<-c(score,power_law$KS.stat)
+}
+result_NL=data.frame(threshold=thr,score=score)
+best<-min(score)
+best_NL<-c(best_NL,result_NL[result_NL$score==best,]$threshold)
+
+```
+```{r eval=FALSE, include=FALSE}
+par(mfrow=c(1,2))
+plot(result_L,type="l",main="Lesional")
+plot(result_NL,type="l",main="Non_Lesional")
+
+```
+
+##### 3.3.2 Kendall
+```{r eval=FALSE, include=FALSE}
+thr<-c()
+score<-c()
+for (i in seq (0,0.78,0.01)){
+  data<-final_data_k[abs(final_data_k$cor)>=i,]
+  g<-graph_from_data_frame(data,directed=F)
+  dist<-degree.distribution(g)
+  power_law<-fit_power_law(dist)
+  thr<-c(thr,i)
+  score<-c(score,power_law$KS.stat)
+}
+result_L=data.frame(threshold=thr,score=score)
+best<-min(score)
+best_L<-c(best_L,result_L[result_L$score==best,]$threshold)
+```
+```{r eval=FALSE, include=FALSE}
+thr<-c()
+score<-c()
+for (i in seq (0,0.78,0.01)){
+  data<-final_data_NL_k[abs(final_data_NL_k$cor)>=i,]
+  g<-graph_from_data_frame(data,directed=F)
+  dist<-degree.distribution(g)
+  power_law<-fit_power_law(dist)
+  thr<-c(thr,i)
+  score<-c(score,power_law$KS.stat)
+}
+result_NL=data.frame(threshold=thr,score=score)
+best<-min(score)
+best_NL<-c(best_NL,result_NL[result_NL$score==best,]$threshold)
+```
+```{r eval=FALSE, include=FALSE}
+par(mfrow=c(1,2))
+plot(result_L,type="l",main="Lesional")
+plot(result_NL,type="l",main="Non_Lesional")
+```
+
+##### 3.3.3 Spearman 
+```{r eval=FALSE, include=FALSE}
+thr<-c()
+score<-c()
+for (i in seq (0,0.9,0.01)){
+  data<-final_data_s[abs(final_data_s$cor)>=i,]
+  g<-graph_from_data_frame(data,directed=F)
+  dist<-degree.distribution(g)
+  power_law<-fit_power_law(dist)
+  thr<-c(thr,i)
+  score<-c(score,power_law$KS.stat)
+}
+result_L=data.frame(threshold=thr,score=score)
+best<-min(score)
+best_L<-c(best_L,result_L[result_L$score==best,]$threshold)
+```
+```{r eval=FALSE, include=FALSE}
+thr<-c()
+score<-c()
+for (i in seq (0,0.9,0.01)){
+  data<-final_data_NL_s[abs(final_data_NL_s$cor)>=i,]
+  g<-graph_from_data_frame(data,directed=F)
+  dist<-degree.distribution(g)
+  power_law<-fit_power_law(dist)
+  thr<-c(thr,i)
+  score<-c(score,power_law$KS.stat)
+}
+result_NL=data.frame(threshold=thr,score=score)
+best<-min(score)
+best_NL<-c(best_NL,result_NL[result_NL$score==best,]$threshold)
+```
+
+```{r eval=FALSE, include=FALSE}
+par(mfrow=c(1,2))
+plot(result_L,type="l",main="Lesional")
+plot(result_NL,type="l",main="Non_Lesional")
+```
+
+```{r eval=FALSE, include=FALSE}
+comparison<-data.frame(lesional=best_L,non_lesional=best_NL)
+rownames(comparison)<-c("pearson","kendall","spearman")
+comparison
+```
+
+This table summarises the best thresholsd for each method. I choose *pearson* for the next steps beacause it has the higher thresholds. 
+
+```{r}
+#I create the final dataframe using the ones with pearson correlations and the thresholds identified above.
+data_L<-final_data_p[abs(final_data_p$cor)>=0.6,]
+data_NL<-final_data_NL_p[abs(final_data_NL_p$cor)>=0.75,]
+```
+
+
+
+#### 3.4 Gene network graph
+##### 3.4.1 iGraph
+```{r}
+g<-graph_from_data_frame(data_L,directed=F)
+dist_L<-degree.distribution(g)
+```
+```{r}
+h<-graph_from_data_frame(data_NL,directed=F)
+dist_NL<-degree.distribution(h)
+```
+```{r}
+par(mfrow=c(1,2))
+plot.igraph(g,vertex.label=NA,vertex.size=5,main="Lesional")
+plot.igraph(h,vertex.label=NA,vertex.size=5, main="Non_Lesional")
+par(mfrow=c(1,2))
+plot(dist_L,main="Lesional")
+plot(dist_NL,main="Non_Lesional")
+
+```
+
+### 4.GENE NETWORK EXPLORATION: Lesional network
+```{r}
+write.csv(data_L,file="data_deg.csv")
+write.csv(data_NL,file="data_deg_NL.csv")
+```
+
+#### 4.1 Topological analyses
+
+##### 4.1.1 Hubs identification
+
+I identify the 3 nodes with the highest *degree* value using CytoHubba app on Cytoscape
+
+```{r}
+include_graphics("hubba_cyt.png")
+```
+
+```{r}
+hubs<-read.csv("hubba.csv",skip=1)
+hubs
+
+```
+```{r}
+biomart <- getBM(attributes=c('ensembl_gene_id',"description"), filters = 'ensembl_gene_id', values =hubs$Name, mart = hsmart)
+biomart
+```
+
+##### 4.1.2 Modules/clusters identification. 
+
+Using G-Lay community clustering method on Cytoscape, I identify the cluster in the Lesional network
+
+```{r }
+include_graphics("data_deg.csv--clustered.png")
+```
+
+```{r}
+cluster<-read.csv("cluster.csv")
+freq<-data.frame(table(cluster$X__glayCluster))
+colnames(freq)<-c("Cluster","Number_of_nodes")
+freq<-freq[order(-freq$Number_of_nodes),]
+head(freq)
+```
+
+#### 4.2 Enrichment Analysis
+
+Using CueGO app on Cytoscape, it is possible to identify over-represented Gene Ontology (GO) terms in the different observed clusters.
+
+```{r}
+cluster1<-cluster[cluster$X__glayCluster==1,3]
+write(cluster1,file="c1.txt")
+```
+
+```{r}
+go<-read.table(file="c1 NodeAttributeTable.txt",sep="\t",header = T)
+go<-go[go$Nr..Genes>=3,c(3,8)]
+go<-go[order(go$Term.PValue),]
+head(go)
+```
+
+```{r}
+cluster2<-cluster[cluster$X__glayCluster==2,3]
+write(cluster2,file="c2.txt")
+go<-read.table(file="c2 NodeAttributeTable.txt",sep="\t",header = T)
+go<-go[go$Nr..Genes>=3,c(3,8)]
+go<-go[order(go$Term.PValue),]
+head(go)
+```
+
+```{r}
+cluster3<-cluster[cluster$X__glayCluster==3,3]
+write(cluster3,file="c3.txt")
+go<-read.table(file="c3 NodeAttributeTable.txt",sep="\t",header = T)
+go<-go[go$Nr..Genes>=3,c(3,8)]
+go<-go[order(go$Term.PValue),]
+head(go)
+```
+
+```{r}
+cluster5<-cluster[cluster$X__glayCluster==5,3]
+write(cluster5,file="c5.txt")
+go<-read.table(file="c5 NodeAttributeTable.txt",sep="\t",header = T)
+go<-go[go$Nr..Genes>=3,c(3,8)]
+go<-go[order(go$Term.PValue),]
+head(go)
+```
+
+### 5.GENE NETWORK EXPLORATION: Non Lesional network
+
+#### 5.1 Topological analyses
+##### 5.1.1 Hubs identification
+```{r}
+hubs<-read.csv("hubba_NL.csv",skip=1)
+hubs
+```
+```{r}
+biomart <- getBM(attributes=c('ensembl_gene_id',"description"), filters = 'ensembl_gene_id', values =hubs$Name, mart = hsmart)
+biomart
+```
+
+
+##### 5.1.2 Modules/clusters identification
+```{r}
+include_graphics("data_deg_NL.csv--clustered.png")
+```
+```{r}
+cluster<-read.csv("cluster_NL.csv")
+freq<-data.frame(table(cluster$X__glayCluster))
+colnames(freq)<-c("Cluster","Number_of_nodes")
+freq<-freq[order(-freq$Number_of_nodes),]
+head(freq)
+```
+
+#### 5.2 Enrichment Analysis
+
+```{r}
+cluster3<-cluster[cluster$X__glayCluster==3,3]
+write(cluster3,file="c3_NL.txt")
+go<-read.table(file="c3_nl NodeAttributeTable.txt",sep="\t",header = T)
+go<-go[go$Nr..Genes>=3,c(3,8)]
+go<-go[order(go$Term.PValue),]
+head(go)
+```
+```{r}
+cluster1<-cluster[cluster$X__glayCluster==1,3]
+write(cluster1,file="c1_nl.txt")
+go<-read.table(file="c1_nl NodeAttributeTable.txt",sep="\t",header = T)
+go<-go[go$Nr..Genes>=3,c(3,8)]
+go<-go[order(go$Term.PValue),]
+head(go)
+```
+```{r}
+cluster4<-cluster[cluster$X__glayCluster==4,3]
+write(cluster4,file="c4_nl.txt")
+go<-read.table(file="c4_nl NodeAttributeTable.txt",sep="\t",header = T)
+go<-go[go$Nr..Genes>=3,c(3,8)]
+go<-go[order(go$Term.PValue),]
+head(go)
+```
+
+### 6. GENE NETWORK VALIDATION
+
+```{r}
+string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+string<-string[string$coexpression>0,c(1,2,6)]
+head(string)
+dim(string)
+
+```
+
+I create the new dataframes for the validation, Using the best thresholds selected in the previous paragraphs 
+
+```{r}
+pearson_l<-final_data_p[abs(final_data_p$cor)>=0.6,]
+pearson_nl<-final_data_NL_p[abs(final_data_NL_p$cor)>=0.75,]
+kendall_l<-final_data_k[abs(final_data_k$cor)>=0.53,]
+kendall_nl<-final_data_NL_k[abs(final_data_NL_k$cor)>=0.55,]
+spearman_l<-final_data_s[abs(final_data_s$cor)>=0.64,]
+spearman_nl<-final_data_NL_s[abs(final_data_NL_s$cor)>=0.55,]
+
+head(pearson_l)
+```
+
+#### 6.1 IDs conversion
+
+```{r message=FALSE, warning=FALSE}
+library("STRINGdb")
+
+# Download interactions for human networks (9606).
+string_db <- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+
+network_mapped_p <- string_db$map(pearson_l, c("row"), removeUnmappedRows = TRUE)
+colnames(network_mapped_p)<-c("row","column","cor","p","String1")
+network_mapped_p <- string_db$map(network_mapped_p, "column", removeUnmappedRows = TRUE)
+colnames(network_mapped_p)<-c("row","column","cor","p","String1","String2")
+
+network_mapped_k <- string_db$map(kendall_l, c("row"), removeUnmappedRows = TRUE)
+colnames(network_mapped_k)<-c("row","column","cor","p","String1")
+network_mapped_k <- string_db$map(network_mapped_k, "column", removeUnmappedRows = TRUE)
+colnames(network_mapped_k)<-c("row","column","cor","p","String1","String2")
+
+network_mapped_s <- string_db$map(spearman_l, c("row"), removeUnmappedRows = TRUE)
+colnames(network_mapped_s)<-c("row","column","cor","p","String1")
+network_mapped_s <- string_db$map(network_mapped_s, "column", removeUnmappedRows = TRUE)
+colnames(network_mapped_s)<-c("row","column","cor","p","String1","String2")
+
+```
+#### 6.2 ROC curve and auROC
+
+For each dataframe, I check which interactions are present both in String and in my data. I add a column "check" with TRUE or FALSE
+```{r}
+network_mapped_p$check <- ifelse(is.na(match(paste0(network_mapped_p$String1, network_mapped_p$String2),paste0(string$protein1, string$protein2))), FALSE, TRUE)
+
+network_mapped_k$check <- ifelse(is.na(match(paste0(network_mapped_k$String1, network_mapped_k$String2),paste0(string$protein1, string$protein2))), FALSE, TRUE)
+
+network_mapped_s$check <- ifelse(is.na(match(paste0(network_mapped_s$String1, network_mapped_s$String2),paste0(string$protein1, string$protein2))), FALSE, TRUE)
+
+```
+
+```{r}
+plot.roc(network_mapped_p$check,network_mapped_p$cor,col="red",main="Lesional Networks")
+lines.roc(network_mapped_k$check,network_mapped_k$cor,col="blue")
+lines.roc(network_mapped_s$check,network_mapped_s$cor,col="green")
+legend("bottomright", legend=c("pearson", "kendall","spearman"), col=c("red", "blue","green"), lwd=2)
+```
+
+I calculate the area under the curve for each ROC cruve-
+```{r}
+auroc_p_les<-auROC(network_mapped_p$check, stat=NULL)
+auroc_k_les<-auROC(network_mapped_k$check, stat=NULL)
+auroc_s_les<-auROC(network_mapped_s$check, stat=NULL)
+```
+
+I perform the same operations on non-lesional data.
+
+```{r message=FALSE, warning=FALSE}
+network_mapped_p <- string_db$map(pearson_nl, c("row"), removeUnmappedRows = TRUE)
+colnames(network_mapped_p)<-c("row","column","cor","p","String1")
+network_mapped_p <- string_db$map(network_mapped_p, "column", removeUnmappedRows = TRUE)
+colnames(network_mapped_p)<-c("row","column","cor","p","String1","String2")
+
+network_mapped_k <- string_db$map(kendall_nl, c("row"), removeUnmappedRows = TRUE)
+colnames(network_mapped_k)<-c("row","column","cor","p","String1")
+network_mapped_k <- string_db$map(network_mapped_k, "column", removeUnmappedRows = TRUE)
+colnames(network_mapped_k)<-c("row","column","cor","p","String1","String2")
+
+network_mapped_s <- string_db$map(spearman_nl, c("row"), removeUnmappedRows = TRUE)
+colnames(network_mapped_s)<-c("row","column","cor","p","String1")
+network_mapped_s <- string_db$map(network_mapped_s, "column", removeUnmappedRows = TRUE)
+colnames(network_mapped_s)<-c("row","column","cor","p","String1","String2")
+```
+
+```{r}
+network_mapped_p$check <- ifelse(is.na(match(paste0(network_mapped_p$String1, network_mapped_p$String2),paste0(string$protein1, string$protein2))), FALSE, TRUE)
+
+network_mapped_k$check <- ifelse(is.na(match(paste0(network_mapped_k$String1, network_mapped_k$String2),paste0(string$protein1, string$protein2))), FALSE, TRUE)
+
+network_mapped_s$check <- ifelse(is.na(match(paste0(network_mapped_s$String1, network_mapped_s$String2),paste0(string$protein1, string$protein2))), FALSE, TRUE)
+```
+
+```{r}
+plot.roc(network_mapped_p$check,network_mapped_p$cor,col="red",main="Non-Lesional Networks")
+lines.roc(network_mapped_k$check,network_mapped_k$cor,col="blue")
+lines.roc(network_mapped_s$check,network_mapped_s$cor,col="green")
+legend("bottomright", legend=c("pearson", "kendall","spearman"), col=c("red", "blue","green"), lwd=2)
+```
+
+```{r}
+auroc_p_nles<-auROC(network_mapped_p$check, stat=NULL)
+auroc_k_nles<-auROC(network_mapped_k$check, stat=NULL)
+auroc_s_nles<-auROC(network_mapped_s$check, stat=NULL)
+```
+
+```{r}
+auroc<-data.frame(c(auroc_p_les,auroc_p_nles),c(auroc_k_les,auroc_k_nles),c(auroc_s_les,auroc_s_nles))
+colnames(auroc)<-c("pearson","kendall","spearman")
+rownames(auroc)<-c("lesional","non-lesional")
+auroc
+```
+
+
+```{r}
+boxplot(auroc, col=c("red","blue","green"))
+```
+
