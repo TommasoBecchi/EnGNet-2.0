@@ -1,0 +1,249 @@
+---
+title: "Optimized_network_evaluation"
+author: "Tommaso Becchi"
+date: "30/4/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message=FALSE, warning=FALSE)
+```
+
+```{r}
+library("STRINGdb")
+library("pROC")
+library("ggplot2")
+library("Biobase")
+library("visNetwork")
+library("tidyr")
+library("igraph")
+```
+
+
+### 1. Optimized graph description
+
+```{r}
+# This function prints a graph using VisNetwork package
+vis_graph<-function(g){
+  nodes<-data.frame("id"=V(g)$name)
+  edges<-data.frame(get.edgelist(g))
+  colnames(edges)<-c("from","to")
+  visNetwork(nodes,edges,height = "700px", width = "100%")
+}
+```
+
+```{r}
+# Interaction with 4 TRUE
+single_scores<-read.csv("score_les")[,c(2:7)]
+# Original network
+original<-graph_from_data_frame(read.csv("original_les")[,c(2:6)])
+# Optimized network
+optimized<-graph_from_data_frame(read.csv("optimized_les")[,c(2:6)])
+vis_graph(optimized)
+```
+
+```{r}
+par(mfrow=c(1,2))
+hist(degree(original),main="Original network",xlab="degree",col="red")
+hist(degree(optimized), main="Optimized network",xlab="degree",col="blue")
+```
+```{r}
+par(mfrow=c(1,2))
+boxplot(abs(E(original)$weight),main="Original network",xlab="edges weight",col="red")
+boxplot(abs(E(optimized)$weight), main="Optimized network",xlab="edges weight", col="blue")
+```
+
+These graphs show that the optimized network has a degree distribution that is more similar to a power-law distribution (scale-freeness property) and that its correlation values are more significant
+
+### 2. Comparison with "one-measure" networks
+To validate our method, I compare the optimized "EngNET" network with the ones obtained only one measure between kendall, spearman, nmi and bicor.
+
+```{r}
+# This function optimizes the graph using "mst" function from "igraph". Since the function aims to minimize the total score, we first change the weights to reverse their order.
+
+automatic_optimization<-function(g){
+  #E(g)$weight<-1-E(g)$weight
+  greedy<-mst(g,weights = E(g)$inverted)
+  #E(greedy)$weight<-1-E(greedy)$weight
+  return(greedy)
+}
+```
+
+```{r}
+# This function converts the gene_id in String_id 
+
+network_id_conversion<-function(my_data,string_db_){
+  network_mapped <- string_db_$map(my_data, c("gene1"), removeUnmappedRows = TRUE)
+  colnames(network_mapped)[4]<-"String1"
+  network_mapped <- string_db_$map(network_mapped, "gene2", removeUnmappedRows = TRUE)
+  colnames(network_mapped)[5]<-"String2"
+
+  network_mapped<-network_mapped[,c(4,5,3)]
+  return(network_mapped)
+}
+```
+
+```{r}
+# This function takes in input the correlation that are present in a network and their weight. It uses string to create a Gold Standard and in returns a roc object.
+
+validation_greedy_networks<-function(corr,string_db_){
+  
+  # ID conversion
+  score_converted<-network_id_conversion(corr,string_db_)
+  
+  # GS creation
+  string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+  string<-string[string$coexpression>0,c(1,2,6)]
+  
+  GS <- string[string$protein1 %in% score_converted$String1 & string$protein2 %in% score_converted$String2,]
+  GS <- GS[order(as.character(GS$protein1, GS$protein2)),] %>% unite("rel", protein1:protein2, na.rm = TRUE, remove = FALSE)
+  score_converted<-score_converted[order(as.character(score_converted$String1, score_converted$String2)),] %>% unite("rel", String1:String2, na.rm = TRUE, remove = FALSE)
+
+  score_converted$diagnostic<-score_converted$rel %in% GS$rel
+  score_converted$rel<-NULL
+  
+  return(roc(score_converted$diagnostic,abs(score_converted[,3])))
+}
+```
+
+
+```{r}
+# This function takes in input the dataframe with the interaction and their 4 values and it creates a optimized networh for each of them. These network are compared with string and the auc values of each graph is stored in a variable. It also creates a graph-object with the 4 roc_curves and the one obtained from the "EngNET" optimized network.
+
+control<-function(single_score, combined){
+  string_db<- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  auroc_col<-c()
+  auroc_graph<-list()
+  for (i in 1:4){
+    value<-single_score[,c(1,2,i+2)]
+    colnames(value)[3]<-"weight"
+    g<-graph_from_data_frame(value,directed=F)
+    E(g)$inverted=1-abs(E(g)$weight)
+    g_greedy<-automatic_optimization(g)
+    data_greedy<-igraph::as_data_frame(g_greedy,what="edges")
+    colnames(data_greedy)<-c("gene1","gene2","weight","inverted")
+    roc_obj<-validation_greedy_networks(data_greedy[,c(1,2,3)],string_db)
+    auroc_col<-c(auroc_col,auc(roc_obj))
+    auroc_graph[[i]]<-roc_obj
+  }
+  
+  data_engnet<-igraph::as_data_frame(combined,what="edges")
+  colnames(data_engnet)<-c("gene1","gene2","weight","inverted")
+  roc_obj<-validation_greedy_networks(data_engnet[,c(1,2,3)],string_db)
+  auroc_col<-c(auroc_col,auc(roc_obj))
+  auroc_graph[[5]]<-roc_obj
+  
+  names(auroc_graph)<-c("kendall","spearman","nmi","bicor","EngNET")
+  roc_graph<-ggroc(auroc_graph)+geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+  roc_result<-list("auroc"=data.frame("name"=c("kendall","spearman","nmi","bicor","EngNET"),"auroc"=auroc_col),"graph"=roc_graph)
+  return(roc_result)
+}
+```
+
+
+```{r}
+auroc_comparison<-control(single_scores,optimized)
+auroc_comparison$graph
+auroc_comparison$auroc<-auroc_comparison$auroc[order(auroc_comparison$auroc$auroc, decreasing = T),]
+auroc_comparison$auroc
+```
+
+### 3. Add original interactions to hubs
+
+```{r}
+identify_hub<-function(g){
+  degree<-data.frame("name"=V(g)$name,"degree"=degree(g))
+  #dist<-boxplot(degree$degree,plot=F)
+  #val<-dist$stats[4,]+1.5*(dist$stats[4,]-dist$stats[2,])
+  val<-boxplot(degree$degree,plot=F)$stats[4,]
+  hub<-degree[degree$degree>val,1]
+  return(hub)
+}
+```
+
+```{r}
+add_hub_original_interaction<-function(hubs, original, optimized,th){
+  original_edges<-igraph::as_data_frame(original,what="edges")
+  hubs_interaction<-original_edges[original_edges$from %in% hubs | original_edges$to %in% hubs,]
+  hubs_interaction_relevant<-hubs_interaction[abs(hubs_interaction$weight)>th,]
+  
+  graph_new<-optimized
+  for (k in 1:dim(hubs_interaction_relevant)[1]){
+    if (are_adjacent(graph_new,hubs_interaction_relevant[k,1],hubs_interaction_relevant[k,2])==FALSE){
+      graph_new<-graph_new+edge(hubs_interaction_relevant[k,1],hubs_interaction_relevant[k,2],"weight"=hubs_interaction_relevant[k,3])}
+  }
+  
+  return(graph_new)
+}
+```
+
+```{r}
+best_th_additional<-function(original,optimized){
+  hub<-identify_hub(optimized)
+  th<-c()
+  auc_<-c()
+  string_db<-STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  for (i in seq(from=0.8, to=0.9, by=0.01)){
+    new<-add_hub_original_interaction(hub, original, optimized, i)
+    corr<-igraph::as_data_frame(new, what="edges")
+    corr<-corr[,c(1,2,3)]
+    colnames(corr)<-c("gene1","gene2","weight")
+    roc_obj<-validation_greedy_networks(corr,string_db)
+    th<-c(th,i)
+    auc_<-c(auc_,auc(roc_obj))
+  }
+  return(data.frame("th"=th,"auc"=auc_))
+}
+
+
+```
+
+
+```{r}
+best_addition<-best_th_additional(original,optimized)
+best_addition
+
+plot(best_addition)
+
+hub<-identify_hub(optimized)
+final_network_added<-add_hub_original_interaction(hub, original, optimized, 0.84)
+
+vis_graph(final_network_added)
+```
+
+```{r}
+
+dimension<-function(single_score, combined){
+  nodes<-c()
+  edges<-c()
+  for (i in 1:4){
+    value<-single_score[,c(1,2,i+2)]
+    colnames(value)[3]<-"weight"
+    g<-graph_from_data_frame(value,directed=F)
+    E(g)$inverted=1-E(g)$weight
+    g_greedy<-automatic_optimization(g)
+    nodes<-c(nodes,length(V(g_greedy)))
+    edges<-c(edges,length(E(g_greedy)))
+  }
+  
+  nodes<-c(nodes,length(V(combined)))
+  edges<-c(edges,length(E(combined)))
+  roc_result<-data.frame("name"=c("kendall","spearman","nmi","bicor","EngNET"),"nodes"=nodes,"edges"=edges)
+  return(roc_result)
+}
+```
+
+```{r}
+dimension(lesional_gene$score,greedy_les$auto)
+```
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,390 @@
+---
+title: "Greedy_optimization"
+author: "Tommaso Becchi"
+date: "24/3/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r}
+library("Biobase")
+library("igraph")
+```
+
+```{r}
+lesional_gene<-list("score"=read.csv("extracted_score_lesional")[,c(2:7)],"bool"=read.csv("extracted_bool_lesional")[,c(2:7)])
+non_lesional_gene<-list("score"=read.csv("extracted_score_non_lesional")[,c(2:7)],"bool"=read.csv("extracted_bool_non_lesional")[,c(2:7)])
+```
+
+### 1. BEST CLASSIFIER
+
+```{r}
+# This function converts the gene_id in String_id 
+
+id_conversion<-function(my_data){
+  library("STRINGdb")
+  string_db <- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  network_mapped <- string_db$map(my_data, c("gene1"), removeUnmappedRows = TRUE)
+  colnames(network_mapped)[7]<-"String1"
+  network_mapped <- string_db$map(network_mapped, "gene2", removeUnmappedRows = TRUE)
+  colnames(network_mapped)[8]<-"String2"
+
+  network_mapped<-network_mapped[,c(7,8,3,4,5,6)]
+  return(network_mapped)
+}
+```
+
+
+```{r}
+# This function calculates the average of the TRUE values, the average of all values and the max for each interaction and it stores these 3 results in 3 new columns. 
+
+avgAll_avgT_max<-function(score_converted,bool_converted){
+  data_abs<-score_converted[,c(1,2)]
+  data_abs[,c(3,4,5,6)]<-abs(score_converted[,c(3,4,5,6)])
+  score_converted$avg_All<-rowMeans(data_abs[,c(3,4,5,6)])
+  score_converted$Max<-rowMax(as.matrix(data_abs[,c(3:6)]))
+  
+  data_abs$kendall2<-ifelse(bool_converted$kendall==T,data_abs$kendall,NA)
+  data_abs$spearman2<-ifelse(bool_converted$spearman==T,data_abs$spearman,NA)
+  data_abs$nmi2<-ifelse(bool_converted$nmi==T,data_abs$nmi,NA)
+  data_abs$bicor2<-ifelse(bool_converted$bicor==T,data_abs$bicor,NA)
+  score_converted$avg_True<-rowMeans(data_abs[,c(7,8,9,10)], na.rm=T)
+  return(score_converted)
+}
+```
+
+```{r}
+# This function takes in input the dataframe with Avg_TRUE, Avg_ALL and MAX columns, it compares these values with "check" column and it prints the roc curve. It also calculates the 3 auroc values.
+
+roc_curves_and_auroc<-function(score_converted){
+  library("pROC")
+  col <-rainbow(3)
+  auroc_data<-c()
+  for (i in 1:3){
+      roc_<-roc(score_converted$diagnostic,score_converted[,i+7])
+      if (i==1){plot.roc(roc_, col=col[i])}
+      else{lines.roc(roc_,col=col[i])}
+      auroc_data<-c(auroc_data,auc(roc_))
+  }
+  leg=colnames(score_converted)[8:10]
+  legend("bottomright", legend=leg, col=col, lwd=2) 
+  auroc<-data.frame("pred"=leg,"auroc"=auroc_data)
+  return(auroc)
+}
+```
+
+
+```{r}
+# This function combines the previuos functions. It takes in input the gene-gene interactions with the 4 correlation scores and it return as final output a dataframe with the auroc values for the different methods.
+
+best_method_validation<-function(list_gene){
+  # ID conversion
+  score_converted<-id_conversion(list_gene$score)
+  bool_converted<-id_conversion(list_gene$bool)
+  
+  # GS creation
+  string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+  string<-string[string$coexpression>0,c(1,2,6)]
+  
+  GS <- string[string$protein1 %in% score_converted$String1 & string$protein2 %in% score_converted$String2,]
+  #score_converted$check <- ifelse(is.na(match(paste0(score_converted$String1, score_converted$String2),paste0(GS$protein1, GS$protein2))), FALSE, TRUE)
+  library("tidyr")
+  GS <- GS[order(as.character(GS$protein1, GS$protein2)),] %>% unite("rel", protein1:protein2, na.rm = TRUE, remove = FALSE)
+  score_converted<-score_converted[order(as.character(score_converted$String1, score_converted$String2)),] %>% unite("rel", String1:String2, na.rm = TRUE, remove = FALSE)
+
+  score_converted$diagnostic<-score_converted$rel %in% GS$rel
+  score_converted$rel<-NULL
+  
+  # Avg_TRUE - Avg_ALL - Max
+  score_converted<-avgAll_avgT_max(score_converted,bool_converted)
+  
+  # Roc curves and Auroc
+  auroc_best<-roc_curves_and_auroc(score_converted)
+  
+  return(auroc_best)
+  
+}
+```
+
+```{r}
+# This function combines lesional and non-lesional results in a single dataframe with the average auroc value for each method
+
+combine_les_nles<-function(lesional_gene,non_lesional_gene){
+  auroc_lesional<-best_method_validation(lesional_gene)
+  auroc_non_lesional<-best_method_validation(non_lesional_gene)
+  auroc_merged<-data.frame("pred"=auroc_lesional$pred,"les"=auroc_lesional$auroc,"Nles"=auroc_non_lesional$auroc)
+  auroc_merged$avg<-rowMeans(auroc_merged[,c(2,3)])
+  auroc_merged<-auroc_merged[order(auroc_merged$avg,decreasing=T),]
+  
+  return(auroc_merged)
+}
+
+```
+
+```{r}
+result<-combine_les_nles(lesional_gene,non_lesional_gene)
+result
+```
+
+
+```{r}
+best_method<-result[1,1]
+```
+
+### 2. GRAPH CREATION
+```{r}
+# This function prints a graph using VisNetwork package
+vis_graph<-function(g){
+  library("visNetwork")
+  nodes<-data.frame("id"=V(g)$name)
+  edges<-data.frame(get.edgelist(g))
+  colnames(edges)<-c("from","to")
+  visNetwork(nodes,edges,height = "700px", width = "100%")
+}
+```
+
+```{r}
+#This function takes in input the gene-gene interaction with the correlation scores. It creates a network with the correct weights based on the best method.
+
+create_graph<-function(score,bool,method){
+  score$sign<-ifelse(score$kendall*score$spearman*score$nmi*score$bicor>0,1,-1)
+  data_abs<-score[,c(1,2)]
+  data_abs[,c(3,4,5,6)]<-abs(score[,c(3,4,5,6)])
+  if (method=="avg_All"){score$weight<-rowMeans(data_abs[,c(3,4,5,6)])}
+  else if (method=="Max"){score$weight<-rowMax(as.matrix(data_abs[,c(3:6)]))}
+  else if (method=="avg_True"){
+    data_abs$kendall2<-ifelse(bool$kendall==T,data_abs$kendall,NA)
+    data_abs$spearman2<-ifelse(bool$spearman==T,data_abs$spearman,NA)
+    data_abs$nmi2<-ifelse(bool$nmi==T,data_abs$nmi,NA)
+    data_abs$bicor2<-ifelse(bool$bicor==T,data_abs$bicor,NA)
+    score$weight<-rowMeans(data_abs[,c(7,8,9,10)], na.rm=T)
+  }
+  
+  score$weight<-score$weight*score$sign
+  
+  g<-graph_from_data_frame(score[,c(1,2,8)],directed=F)
+  E(g)$abs<-abs(E(g)$weight)
+  E(g)$inverted<-1-E(g)$abs
+  return(g)
+}
+```
+
+
+```{r}
+lesional_graph<-create_graph(lesional_gene$score,lesional_gene$bool,best_method)
+non_lesional_graph<-create_graph(non_lesional_gene$score,non_lesional_gene$bool,best_method)
+```
+
+
+### 3. GREEDY OPTIMIZATION
+
+```{r}
+# This function optimizes the graph using "mst" function from "igraph". Since the function aims to minimize the total score, we first change the weights to reverse their order.
+
+automatic_optimization<-function(g){
+  #E(g)$weight<-1-E(g)$weight
+  greedy<-mst(g,weights = E(g)$inverted)
+  #E(greedy)$weight<-1-E(greedy)$weight
+  return(greedy)
+}
+```
+
+
+```{r}
+# This function optimizes the graph in a iterative way. First of all, it creates a dataframe with all the edges and it order this dataframe from the minimum to the maximum weight. Then it removes the edge with the lowest weight. After this operation it checks if all the nodes can still reach the same nodes with which they were originally connected. If this condition is TRUE for all the nodes, the edge is removed, otherwise it re-adds the edge.
+
+manual_optimization<-function(g){
+  reference<-g
+  
+  edg<-data.frame(get.edgelist(g))
+  edg$weight<-E(g)$weight
+  edg<-edg[order(abs(edg$weight)),]
+  
+  for (i in 1:dim(edg)[1]){
+    g<-g-edge(paste0(edg[i,1],"|",edg[i,2]))
+    del<-T
+    if(setequal(subcomponent(reference,edg[i,1])$name,subcomponent(g,edg[i,1])$name)==F){del<-F}
+    if(setequal(subcomponent(reference,edg[i,2])$name,subcomponent(g,edg[i,2])$name)==F){del<-F}
+    if (del==F){g<-g+edge(edg[i,1],edg[i,2],weight=edg[i,3])}
+  }
+  
+  return(g)
+}
+```
+
+
+
+```{r}
+greedy_les<-list("auto"=automatic_optimization(lesional_graph),"iter"=manual_optimization(lesional_graph))
+
+greedy_Nles<-list("auto"=automatic_optimization(non_lesional_graph),"iter"=manual_optimization(non_lesional_graph))
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+hist(degree(lesional_graph),main="Original network",xlab="degree")
+hist(degree(greedy_les$auto), main="Optimized network",xlab="degree")
+```
+```{r}
+par(mfrow=c(1,2))
+hist(degree(greedy_les$iter),main="Iterative network",xlab="degree")
+hist(degree(greedy_les$auto), main="MST network",xlab="degree")
+
+par(mfrow=c(1,2))
+hist(E(greedy_les$iter)$weight,main="Iterative network",xlab="weight")
+hist(E(greedy_les$auto)$weight, main="MST network",xlab="weight")
+
+par(mfrow=c(1,1))
+```
+
+
+
+```{r}
+write.csv(igraph::as_data_frame(greedy_les$auto,what="edges"),"optimized_les")
+write.csv(igraph::as_data_frame(lesional_graph,what="edges"),"original_les")
+write.csv(lesional_gene$score, "score_les")
+```
+
+
+
+```{r}
+# This function converts the gene_id in String_id 
+
+network_id_conversion<-function(my_data,string_db_){
+  network_mapped <- string_db_$map(my_data, c("gene1"), removeUnmappedRows = TRUE)
+  colnames(network_mapped)[4]<-"String1"
+  network_mapped <- string_db_$map(network_mapped, "gene2", removeUnmappedRows = TRUE)
+  colnames(network_mapped)[5]<-"String2"
+
+  network_mapped<-network_mapped[,c(4,5,3)]
+  return(network_mapped)
+}
+```
+
+```{r}
+validation_greedy_networks<-function(corr,string_db_){
+  
+  # ID conversion
+  score_converted<-network_id_conversion(corr,string_db_)
+  
+  # GS creation
+  string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+  string<-string[string$coexpression>0,c(1,2,6)]
+  
+  GS <- string[string$protein1 %in% score_converted$String1 & string$protein2 %in% score_converted$String2,]
+  library("tidyr")
+  GS <- GS[order(as.character(GS$protein1, GS$protein2)),] %>% unite("rel", protein1:protein2, na.rm = TRUE, remove = FALSE)
+  score_converted<-score_converted[order(as.character(score_converted$String1, score_converted$String2)),] %>% unite("rel", String1:String2, na.rm = TRUE, remove = FALSE)
+
+  score_converted$diagnostic<-score_converted$rel %in% GS$rel
+  score_converted$rel<-NULL
+  
+  return(roc(score_converted$diagnostic,abs(score_converted[,3])))
+}
+```
+
+
+```{r}
+control<-function(original, combined){
+  library("STRINGdb")
+  library("pROC")
+  library("ggplot2")
+  string_db<- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  auroc_col<-c()
+  auroc_graph<-list()
+  for (i in 1:4){
+    value<-original[,c(1,2,i+2)]
+    colnames(value)[3]<-"weight"
+    g<-graph_from_data_frame(value,directed=F)
+    E(g)$inverted=1-E(g)$weight
+    g_greedy<-automatic_optimization(g)
+    data_greedy<-as_data_frame(g_greedy,what="edges")
+    colnames(data_greedy)<-c("gene1","gene2","weight","inverted")
+    roc_obj<-validation_greedy_networks(data_greedy[,c(1,2,3)],string_db)
+    auroc_col<-c(auroc_col,auc(roc_obj))
+    auroc_graph[[i]]<-roc_obj
+  }
+  
+  data_engnet<-as_data_frame(combined,what="edges")
+  colnames(data_engnet)<-c("gene1","gene2","weight","inverted")
+  roc_obj<-validation_greedy_networks(data_engnet[,c(1,2,3)],string_db)
+  auroc_col<-c(auroc_col,auc(roc_obj))
+  auroc_graph[[5]]<-roc_obj
+  
+  names(auroc_graph)<-c("kendall","spearman","nmi","bicor","EngNET")
+  roc_graph<-ggroc(auroc_graph)+geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+  roc_result<-list("auroc"=data.frame("name"=c("kendall","spearman","nmi","bicor","EngNET"),"auroc"=auroc_col),"graph"=roc_graph)
+  return(roc_result)
+}
+```
+
+
+```{r}
+controllo_auroc<-control(lesional_gene$score,greedy_les$auto)
+controllo_auroc$graph
+controllo_auroc$auroc<-controllo_auroc$auroc[order(controllo_auroc$auroc$auroc, decreasing = T),]
+controllo_auroc$auroc
+```
+
+### 4. ADD INTERACTIONS TO HUBS
+
+```{r}
+identify_hub<-function(g){
+  degree<-data.frame("name"=V(g)$name,"degree"=degree(g))
+  dist<-boxplot(degree$degree,plot=F)
+  val<-dist$stats[4,]+1.5*(dist$stats[4,]-dist$stats[2,])
+  hub<-degree[degree$degree>val,1]
+  return(hub)
+}
+```
+
+```{r}
+add_hub_original_interaction<-function(hubs, original, optimized,th){
+  original_edges<-as_data_frame(original,what="edges")
+  hubs_interaction<-original_edges[original_edges$from %in% hubs | original_edges$to %in% hubs,]
+  hubs_interaction_relevant<-hubs_interaction[abs(hubs_interaction$weight)>th,]
+  
+  graph_new<-optimized
+  for (k in 1:dim(hubs_interaction_relevant)[1]){
+    if (are_adjacent(graph_new,hubs_interaction_relevant[k,1],hubs_interaction_relevant[k,2])==FALSE){
+      graph_new<-graph_new+edge(hubs_interaction_relevant[k,1],hubs_interaction_relevant[k,2],"weight"=hubs_interaction_relevant[k,3])}
+  }
+  
+  return(graph_new)
+}
+```
+
+```{r}
+best_th_additional<-function(original,optimized){
+  library("STRINGdb")
+  hub<-identify_hub(optimized)
+  th<-c()
+  auc_<-c()
+  string_db<-STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  for (i in seq(from=0.7, to=0.8, by=0.01)){
+    new<-add_hub_original_interaction(hub, original, optimized, i)
+    corr<-as_data_frame(new, what="edges")
+    corr<-corr[,c(1,2,3)]
+    colnames(corr)<-c("gene1","gene2","weight")
+    roc_obj<-validation_greedy_networks(corr,string_db)
+    th<-c(th,i)
+    auc_<-c(auc_,auc(roc_obj))
+  }
+  return(data.frame("th"=th,"auc"=auc_))
+}
+
+
+```
+
+
+```{r}
+best_addition<-best_th_additional(lesional_graph,greedy_les$auto)
+plot(best_addition)
+```
+
+
+
