@@ -1,0 +1,178 @@
+---
+title: "Comparison"
+author: "Tommaso Becchi"
+date: "29/5/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+
+```{r}
+library(dplyr)
+library("edgeR")
+library("psych")
+library("knitr")
+library("pROC")
+library("minet")
+library("entropy")
+library("WGCNA")
+library("infotheo")
+library("igraph")
+library("tidyr")
+library("STRINGdb")
+
+```
+
+```{r}
+eng1_AL<-read.table("EngNET1_AL.txt",header=T)
+eng1_NL<-read.table("EngNET1_NL.txt",header=T)
+
+validation_lesional_score<-read.csv("lesional_scores")[,c(2:7)]
+validation_Nlesional_score<-read.csv("non_lesional_scores")[,c(2:7)]
+validation_lesional_th<-read.csv("th_lesional")[,c(2:5)]
+validation_Nlesional_th<-read.csv("th_non_lesional")[,c(2:5)]
+validation_final_lesional<-read.csv("final_les")[,c(2:4)]
+validation_final_Nlesional<-read.csv("final_Nles")[,c(2:4)]
+GS<-read.csv("GS")[,c(2:5)]
+```
+
+
+```{r}
+id_conversion<-function(my_data){
+  string_db <- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  n_columns<-(dim(my_data)[2])
+  scores_mapped <- string_db$map(my_data, c("gene1"), removeUnmappedRows = TRUE)
+  colnames(scores_mapped)[n_columns+1]<-"String1"
+  scores_mapped <- string_db$map(scores_mapped, "gene2", removeUnmappedRows = TRUE)
+  colnames(scores_mapped)[n_columns+2]<-"String2"
+
+  scores_mapped<-scores_mapped[,c(n_columns+1,n_columns+2,3:n_columns)]
+  return(scores_mapped)
+}
+```
+
+```{r}
+from_network_to_auc<-function(network,GS){
+  interactions<-data.frame(get.edgelist(network))
+  interactions$weight<-(E(network)$weight)
+  colnames(interactions)<-c("gene1","gene2","weight")
+  converted<-id_conversion(interactions)
+  
+  converted<-converted[order(as.character(converted$String1,converted$String2)),] %>% unite("rel", String1:String2, na.rm = TRUE, remove = FALSE)
+
+  converted$diagnostic<-converted$rel %in% GS$rel
+  converted$rel<-NULL
+  return(roc(converted$diagnostic,abs(converted$weight)))
+}
+```
+
+```{r}
+log_fitting<-function(net){
+    Freq <- as.data.frame(table(degree(net)))
+    colnames(Freq) <- c("degree", "AF")
+    Freq$degree <- as.numeric(Freq$degree)
+    Freq$RF <- Freq$AF / sum(Freq$AF)
+ 
+    lmDeg <- lm(log(RF) ~ log(degree), data = Freq)
+    return(summary(lmDeg)$adj.r.squared)
+}
+
+```
+
+
+```{r}
+networks_info<-function(net,GS){
+  r<-log_fitting(net)
+  roc_obj<-from_network_to_auc(net,GS)
+  edg<-length(E(net))
+  vert<-length(V(net))
+  
+  return(list("roc"=roc_obj,"r"=r,"vert"=vert,"edg"=edg))
+}
+
+```
+
+```{r}
+final_validation<-function(score,th,eng1,eng2,GS){
+  
+  kendall<-score[abs(score$kendall)>th$kendall,c(1,2,3)]
+  colnames(kendall)[3]<-"weight"
+  kendall_net<-graph_from_data_frame(kendall,directed=F)
+  info_kendall<-networks_info(kendall_net,GS)
+  
+  spearman<-score[abs(score$spearman)>th$spearman,c(1,2,4)]
+  colnames(spearman)[3]<-"weight"
+  spearman_net<-graph_from_data_frame(spearman,directed=F)
+  info_spearman<-networks_info(spearman_net,GS)
+  
+  nmi<-score[abs(score$nmi)>th$nmi,c(1,2,5)]
+  colnames(nmi)[3]<-"weight"
+  nmi_net<-graph_from_data_frame(nmi,directed=F)
+  info_nmi<-networks_info(nmi_net,GS)
+  
+  bicor<-score[abs(score$bicor)>th$bicor,c(1,2,6)]
+  colnames(bicor)[3]<-"weight"
+  bicor_net<-graph_from_data_frame(bicor,directed=F)
+  info_bicor<-networks_info(bicor_net,GS)
+  
+  colnames(eng1)[3]<-"weight"
+  eng1_net<-graph_from_data_frame(eng1,directed=F)
+  info_eng1<-networks_info(eng1_net,GS)
+  
+  info_eng2<-networks_info(eng2,GS)
+  
+  return(list("kendall"=info_kendall,"spearman"=info_spearman,"nmi"=info_nmi,"bicor"=info_bicor,"eng1"=info_eng1,"eng2"=info_eng2))
+}
+
+
+```
+
+
+```{r}
+validation_final_lesional_net<-graph_from_data_frame(validation_final_lesional,directed=F)
+validation_final_Nlesional_net<-graph_from_data_frame(validation_final_Nlesional,directed=F)
+
+result_Lesional<-final_validation(validation_lesional_score,validation_lesional_th,eng1_AL,validation_final_lesional_net,GS)
+result_non_Lesional<-final_validation(validation_Nlesional_score,validation_Nlesional_th,eng1_NL,validation_final_Nlesional_net,GS)
+
+```
+
+```{r}
+print_curves<-function(result){
+  par(pty="s")
+  color<-rainbow(6)
+  plot.roc(result$kendall$roc,col=color[1])
+  lines.roc(result$spearman$roc,col=color[2])
+  lines.roc(result$nmi$roc,col=color[3])
+  lines.roc(result$bicor$roc,col=color[4])
+  lines.roc(result$eng1$roc,col=color[5])
+  lines.roc(result$eng2$roc,col=color[6])
+  legend("bottomright", legend=c("kendall","spearman","nmi","bicor","EnGNet1","EnGNet2"), col=color, lwd=2)
+}
+```
+
+```{r}
+summarize_results<-function(result){
+  first<-c(auc(result$kendall$roc),auc(result$spearman$roc),auc(result$nmi$roc),auc(result$bicor$roc),auc(result$eng1$roc),auc(result$eng2$roc))
+  second<-c(result$kendall$r,result$spearman$r,result$nmi$r,result$bicor$r,result$eng1$r,result$eng2$r)
+  third<-c(result$kendall$vert,result$spearman$vert,result$nmi$vert,result$bicor$vert,result$eng1$vert,result$eng2$vert)
+  fourth<-c(result$kendall$edg,result$spearman$edg,result$nmi$edg,result$bicor$edg,result$eng1$edg,result$eng2$edg)
+ table_final<-data.frame("auc"=first,"fitting_power_law"=second,"nodes"=third,"edges"=fourth)
+ rownames(table_final)<-c("kendall","spearman","nmi","bicor","EnGNet1","EnGNet2")
+ return(table_final)
+}
+```
+
+
+```{r}
+
+print_curves(result_Lesional)
+print_curves(result_non_Lesional)
+summarize_results(result_Lesional)
+summarize_results(result_non_Lesional)
+
+```
+

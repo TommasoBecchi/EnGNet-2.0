@@ -1,0 +1,384 @@
+---
+title: "Performance evaluation"
+author: "Tommaso Becchi"
+date: "14/3/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+### 0. IMPORT LIBRARIES
+```{r}
+library("GEOquery")
+library(dplyr)
+library("limma")
+library("edgeR")
+library("psych")
+library("knitr")
+library("pROC")
+library("minet")
+library("entropy")
+library("WGCNA")
+library("infotheo")
+library("igraph")
+```
+
+### 1. IMPORT THE DATASET
+#### 1.1 Series Matrix 
+```{r}
+# SERIES MATRIX
+info=getGEO(filename="GSE157194_series_matrix.txt")
+
+# COUNT TABLE
+gene_expression=read.delim(file="Raw_gene_counts_matrix.txt",row.names = 1)
+```
+
+
+#### 1.2 Extract useful information from Series Matrix 
+```{r}
+sampleinfo<-pData(info)
+#I select only the sample measured before the start of therapy
+gene_expression<-gene_expression[,1:111]
+sampleinfo<-sampleinfo[1:111,]
+#From sampleinfo I extract the field which refers to the AL/AN condition
+sampleinfo2<-select(sampleinfo, source_name_ch1 )
+rownames(sampleinfo2)<-colnames(gene_expression)
+colnames(sampleinfo2)<-c("group")
+#I change the varibles name to better visualize the groups
+sampleinfo2$group[which(sampleinfo2$group == "m0_AL") ] <- "Lesional"
+sampleinfo2$group[which(sampleinfo2$group == "m0_AN") ] <- "Non_Lesional"
+head(sampleinfo2)
+```
+
+### 2. DATA PRE-PROCESSING
+#### 2.1 Removing genes that are lowly expressed
+```{r}
+x<-DGEList(gene_expression)
+
+#The filterByExpr function provides an automatic way to filter genes that are lowly expressed
+keep.exprs <- filterByExpr(x, group=sampleinfo2$group)
+x <- x[keep.exprs,, keep.lib.sizes=FALSE]
+```
+
+#### 2.2 Normalising gene expression distributions
+```{r}
+#Normalisation by the method of trimmed mean of M-values (TMM)
+x2 <- calcNormFactors(x, method="TMM")  
+```
+
+#### 2.3 Differential gene expression analyses
+```{r}
+design <- model.matrix(~ 0 + sampleinfo2$group)
+colnames(design) <- c("Lesional","Non_Lesional")
+cont.matrix <- makeContrasts(LesVsNonLes= Lesional - Non_Lesional,levels=design)
+
+#Voom converts raw counts to log-CPM values by automatically extracting library sizes and normalisation factors from x itself
+v <- voom(x2, design, plot=FALSE)
+vfit <- lmFit(v, design)
+vfit <- contrasts.fit(vfit, contrasts=cont.matrix)
+```
+
+```{r}
+tfit <- treat(vfit, lfc=0.5)
+dt <- decideTests(tfit)
+summary(dt)
+results<-data.frame(dt)
+results$id<-rownames(results)
+DEGs<-results[results$LesVsNonLes!=0,]
+```
+
+#### 2.4 CQN of DEGs
+```{r}
+#Create two dataframe with raw counts, one for DEGs in lesional samples and one for DEGs in non-lesional samples
+gene_final<-data.frame(x$counts)
+count_AL<-gene_final[rownames(gene_final)%in% DEGs$id,sampleinfo2$group=="Lesional"]
+dim(count_AL)
+count_NL<-gene_final[rownames(gene_final)%in% DEGs$id,sampleinfo2$group=="Non_Lesional"]
+dim(count_NL)
+#Since lesional dataframe contains more samples than non.lesional one, I remove 3 columns in lesional dataframe
+count_AL<-count_AL[,1:54]
+```
+
+
+```{r}
+### This function takes in input an expression matrix with raw data and it calculates the matrix with CQN data
+
+cqn_data<-function(hsmart,raw_count){
+  library("cqn")
+  biomart2<- getBM(attributes=c('ensembl_gene_id','start_position','end_position', 'percentage_gene_gc_content'), filters = 'ensembl_gene_id', values =rownames(raw_count), mart = hsmart)   
+  biomart2$length<-biomart2$end_position-biomart2$start_position
+  gene_length_gc<-biomart2[,c(1,4,5)]
+  both <-rownames (raw_count)%in% gene_length_gc$ensembl_gene_id
+  raw_count<-raw_count[both==TRUE,]
+  cqn.subset<-cqn(raw_count,lengths=gene_length_gc$length,x=gene_length_gc$percentage_gene_gc_content)
+  normalized_data<-data.frame(cqn.subset$y+cqn.subset$offset)
+}
+
+```
+
+```{r}
+library("biomaRt")
+hsmart <- useMart(dataset = "hsapiens_gene_ensembl", biomart = "ensembl")
+normalized_count_AL<-cqn_data(hsmart,count_AL)
+normalized_count_NL<-cqn_data(hsmart,count_NL)
+```
+
+
+
+### 3 Correlation matrices
+I chose Biweight Midcorrelation as second non-linear score. It is median-based, rather than mean-based, thus is less sensitive to outliers, and can be a robust alternative to other similarity metrics, such as Pearson correlation or mutual information.
+
+This measure was used for a gene co-expression study in "Zheng, Chun-Hou, et al. "Gene differential coexpression analysis based on biweight correlation and maximum clique." BMC bioinformatics. Vol. 15. No. 15. BioMed Central, 2014." 
+The results explain that Biweight Midcorrelation is more robust for outliers than other methods.
+
+```{r}
+### This function takes in input a dataframe with NxN gene-gene interactions and it returns a daframe with a single row for each pair of gene anf the value of their correlation.
+
+flattenCorrMatrix <- function(cormat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut]
+    #p = pmat[ut]
+  )
+}
+```
+
+
+```{r}
+### This function takes in input a dataframe with NxN gene-gene interactions. It first calculates the value of the correlation for each pair of genes for the 4 selected measures. Then, it uses "flattenCorrMatrix" function to obtain the dataframes wit a single row for each relationship and in the end, it combines all the scores in a single dataframe with 6 columns: gene1-gene2-kendall-pearson-NMI-bicor
+
+scores<-function(tab){
+  #### Kendall
+  kendall<-corr.test(t(tab),method="kendall",adjust="BH",ci=FALSE)
+  kendall<-flattenCorrMatrix(kendall$r)
+  kendall<-kendall[order(kendall$row),]
+  
+  #### Spearman
+  spearman<-corr.test(t(tab),method="spearman",adjust="BH",ci=FALSE)
+  spearman<-flattenCorrMatrix(spearman$r)
+  spearman<-spearman[order(spearman$row),]
+  
+  #### NMI
+  mi<-mutualInfoAdjacency(t(normalized_count_AL))
+  mutinfo<-flattenCorrMatrix(mi$MutualInformation)
+  mutinfo<-mutinfo[order(mutinfo$row),]
+
+  #### Biweight Midcorrelation
+  bicor<-bicorAndPvalue(t(tab), y=NULL)
+  bicor<-flattenCorrMatrix(bicor$bicor)
+  bicor<-bicor[order(bicor$row),]
+
+  final<-data.frame("gene1"=kendall$row,"gene2"=kendall$column,"kendall"=kendall$cor,"spearman"=spearman$cor,"nmi"=mutinfo$cor,"bicor"=bicor$cor)
+
+  final
+}
+
+```
+
+### 4 Best thresholds
+
+```{r}
+### This function takes in input a dataframe with a row for each gene-gene correlation and one of the 4 columns between kendall, pearson, nmi and bicor. It returns the threshold that allows to obtain the network that better fits with a power-low distribution.
+
+best_thresholds<-function(interactions,column,start_v,end_v){
+  thr<-c()
+  score<-c()
+  for (i in seq (start_v,end_v,0.01)){
+  data<-interactions[abs(interactions[,column])>=i,c(1,2,column)]
+  g<-graph_from_data_frame(data,directed=F)
+  dist<-degree.distribution(g)
+  power_law<-fit_power_law(dist)
+  thr<-c(thr,i)
+  #K.stat describes how better the distribution fits a power-law. Smaller scores denote better fit.
+  score<-c(score,power_law$KS.stat)
+  }
+  result_L=data.frame(threshold=thr,score=score)
+  best<-min(score)
+  result_L[result_L$score==best,]$threshold
+}
+
+```
+
+
+```{r}
+### This function takes in input a dataframe with a single row for each gene-gene relationship. It first uses "best_thresholds" function to calculate the 4 best thresholds. Then it creates a new dataframe with a row for each gene-gene relationship with 6 column gene1-gene2-kendall-spearma-NMI-bicor. The last 4 column contains TRUE/FALSE if the score is above or not the best threshold.
+
+TrueAndFalse<-function(tab){
+  best_L<-c()
+  ### Kendall
+  best_L<-c(best_L,best_thresholds(tab,3,0.5,0.75))
+  ### Spearman
+  best_L<-c(best_L,best_thresholds(tab,4,0.5,0.75))
+  ### NMI
+  best_L<-c(best_L,best_thresholds(tab,5,0.5,0.75))
+  ### Biweight Midcorrelation
+  best_L<-c(best_L,best_thresholds(tab,6,0.5,0.75))
+  
+  best_thr<-data.frame(t(best_L))
+  head(best_thr)
+  
+  trueandfalse<-tab[,c(1,2)]
+  #for (i in 1:4){
+   # over<-c()
+    #for (j in 1:dim(trueandfalse)[1]){
+     # if (abs(tab[j,i+2])>=best_thr[1,i]){over<-c(over,TRUE)}
+      #else {over<-c(over,FALSE)}
+    #}
+    #trueandfalse[,i+2]<-over
+  #}
+  trueandfalse$kendall<-ifelse(abs(tab$kendall)>=best_thr[1,1],T,F)
+  trueandfalse$spearman<-ifelse(abs(tab$spearman)>=best_thr[1,2],T,F)
+  trueandfalse$nmi<-ifelse(abs(tab$nmi)>=best_thr[1,3],T,F)
+  trueandfalse$bicor<-ifelse(abs(tab$bicor)>=best_thr[1,4],T,F)
+
+  #colnames(trueandfalse)<-c("gene1","gene2","kendall","spearman","NMI","Bicor")
+  trueandfalse
+}
+```
+
+
+### 5. Best combination
+
+```{r}
+### This daframe shows all the possible combinations with at lest one TRUE
+
+all_comb<-data.frame(
+  (c(T,T,T,T)),(c(T,T,T,F)),(c(T,T,F,T)),
+  (c(T,F,T,T)),(c(F,T,T,T)),(c(T,T,F,F)),
+  (c(T,F,T,F)),(c(T,F,F,T)),(c(F,T,T,F)),
+  (c(F,T,F,T)),(c(F,F,T,T)),(c(T,F,F,F)),
+  (c(F,T,F,F)),(c(F,F,T,F)),(c(F,F,F,T))
+)
+
+all_comb<-data.frame(t(all_comb))
+rownames(all_comb)<-c("K+S+N+B","K+S+N","K+S+B","K+N+B","S+N+B","K+S","K+N","K+B","S+N","S+B","N+B","K","S","N","B")
+colnames(all_comb)<-c("kendall","spearman","NMI","Bicor")
+all_comb
+```
+
+
+```{r}
+# This function creates 15 new colums, one for each combination. These columns contain TRUE if a combination belongs to a combination, FALSE otherwise.
+
+add_columns<-function(trueandfalse,score,all_comb){
+  for (k in 1:15){
+  v<-as.character(all_comb[k,])
+  newc<-c()
+  for (i in 1:dim(score)[1]){
+    if (trueandfalse[i,3]==v[1] & trueandfalse[i,4]==v[2] & trueandfalse[i,5]==v[3] & trueandfalse[i,6]==v[4]){newc<-c(newc,TRUE)}
+    else{newc<-c(newc,FALSE)}
+    }
+  score[,k+6]<-newc
+  }
+  for (i in 1:15){
+  colnames(score)[i+6]<-rownames(all_comb)[i]
+  }
+  score
+}
+```
+
+```{r}
+# This function converts the gene_id in string_id
+
+conversion<-function(score){
+  library("STRINGdb")
+  string_db <- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  
+  network_mapped <- string_db$map(score, "gene1", removeUnmappedRows = TRUE)
+  colnames(network_mapped)[22]<-"String1"
+  network_mapped <- string_db$map(network_mapped, "gene2", removeUnmappedRows = TRUE)
+  colnames(network_mapped)[23]<-"String2"
+  network_mapped
+}
+```
+
+```{r}
+# This function creates a dataframe with 15 rows, one for each combinations. Each row has 4 columns: TP, FP, FN, TN 
+
+create_matrix<-function(network_mapped,all_comb){
+  conf_matrix<-data.frame("TP"=rep(0,15),"FP"=rep(0,15),"FN"=rep(0,15),"TN"=rep(0,15))
+  rownames(conf_matrix)<-rownames(all_comb)
+  
+  for (k in 1:15){
+    for (i in 1:dim(network_mapped)[1]){
+      if (network_mapped[i,k+6]==T & network_mapped[i,24]==T){conf_matrix[k,1]=conf_matrix[k,1]+1}
+      else if (network_mapped[i,k+6]==T & network_mapped[i,24]==F){conf_matrix[k,2]=conf_matrix[k,2]+1}
+      else if (network_mapped[i,k+6]==F & network_mapped[i,24]==T){conf_matrix[k,3]=conf_matrix[k,3]+1}
+      else if (network_mapped[i,k+6]==F & network_mapped[i,24]==F){conf_matrix[k,4]=conf_matrix[k,4]+1}
+    }
+  }
+  conf_matrix
+}
+```
+
+#### 5.1 LESIONAL
+
+```{r}
+# matrix with 4 scores for each pair of genes
+Lesional_score<-scores(normalized_count_AL)
+head(Lesional_score)
+```
+
+```{r}
+# matrix with TRUE/FALSE if a correlation value is greater or lower than the best threshold
+trueandfalse<-TrueAndFalse(Lesional_score)
+head(trueandfalse)
+```
+
+```{r}
+# matrix with TRUE/FALSE if a pair of genes belongs to a combination
+Lesional_score<-add_columns(trueandfalse,Lesional_score,all_comb)
+head(Lesional_score)
+```
+
+```{r}
+# ID conversion
+network_mapped<-conversion(Lesional_score)
+
+# GS
+string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+string<-string[string$coexpression>0,c(1,2,6)]
+GS <- string[string$protein1 %in% network_mapped$String1 & string$protein2 %in% network_mapped$String2,]
+
+# "check" column verify if an interaction is present or not in GS
+network_mapped$check <- ifelse(is.na(match(paste0(network_mapped$String1, network_mapped$String2),paste0(GS$protein1, GS$protein2))), FALSE, TRUE)
+
+final_results<-create_matrix(network_mapped,all_comb)
+
+```
+
+The following table shows the results after the comparson with GS
+For each combination, TP-FP-FN-TN are calculated:
+  TP= TRUE for the combination and present in GS
+  FP= TRUE for the combination and not present in GS
+  FN= FALSE for the combination and present in GS
+  TN= FALSE for the combination and not present in GS
+  
+```{r}
+final_results
+```
+#### 5.1 NON-LESIONAL
+```{r}
+Lesional_score<-scores(normalized_count_NL)
+trueandfalse<-TrueAndFalse(Lesional_score)
+Lesional_score<-add_columns(trueandfalse,Lesional_score,all_comb)
+
+# ID conversion
+network_mapped<-conversion(Lesional_score)
+
+# GS
+string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+string<-string[string$coexpression>0,c(1,2,6)]
+GS <- string[string$protein1 %in% network_mapped$String1 & string$protein2 %in% network_mapped$String2,]
+
+# "check" column verify if an interaction is present or not in GS
+network_mapped$check <- ifelse(is.na(match(paste0(network_mapped$String1, network_mapped$String2),paste0(GS$protein1, GS$protein2))), FALSE, TRUE)
+
+final_results<-create_matrix(network_mapped,all_comb)
+final_results
+```

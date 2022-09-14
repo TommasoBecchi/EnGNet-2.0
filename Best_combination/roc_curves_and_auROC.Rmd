@@ -1,0 +1,713 @@
+---
+title: "Best combination (ROC curve validation)"
+author: "Tommaso Becchi"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+### 0. IMPORT LIBRARIES
+```{r}
+library("GEOquery")
+library(dplyr)
+library("limma")
+library("edgeR")
+library("psych")
+library("knitr")
+library("pROC")
+library("minet")
+library("entropy")
+library("WGCNA")
+library("infotheo")
+library("igraph")
+library("visNetwork")
+```
+
+### 1. IMPORT THE DATASET
+#### 1.1 Series Matrix 
+```{r}
+# SERIES MATRIX
+info=getGEO(filename="GSE157194_series_matrix.txt")
+
+# COUNT TABLE
+gene_expression=read.delim(file="Raw_gene_counts_matrix.txt",row.names = 1)
+```
+
+
+#### 1.2 Extract useful information from Series Matrix 
+```{r}
+sampleinfo<-pData(info)
+#I select only the sample measured before the start of therapy
+gene_expression<-gene_expression[,1:111]
+sampleinfo<-sampleinfo[1:111,]
+#From sampleinfo I extract the field which refers to the AL/AN condition
+sampleinfo2<-select(sampleinfo, source_name_ch1 )
+rownames(sampleinfo2)<-colnames(gene_expression)
+colnames(sampleinfo2)<-c("group")
+#I change the varibles name to better visualize the groups
+sampleinfo2$group[which(sampleinfo2$group == "m0_AL") ] <- "Lesional"
+sampleinfo2$group[which(sampleinfo2$group == "m0_AN") ] <- "Non_Lesional"
+```
+
+### 2. DATA PRE-PROCESSING
+#### 2.1 Removing genes that are lowly expressed
+```{r}
+x<-DGEList(gene_expression)
+
+#The filterByExpr function provides an automatic way to filter genes that are lowly expressed
+keep.exprs <- filterByExpr(x, group=sampleinfo2$group)
+x <- x[keep.exprs,, keep.lib.sizes=FALSE]
+```
+
+#### 2.2 Normalising gene expression distributions
+```{r}
+#Normalisation by the method of trimmed mean of M-values (TMM)
+x2 <- calcNormFactors(x, method="TMM")  
+```
+
+#### 2.3 Differential gene expression analyses
+```{r}
+design <- model.matrix(~ 0 + sampleinfo2$group)
+colnames(design) <- c("Lesional","Non_Lesional")
+cont.matrix <- makeContrasts(LesVsNonLes= Lesional - Non_Lesional,levels=design)
+
+#Voom converts raw counts to log-CPM values by automatically extracting library sizes and normalisation factors from x itself
+v <- voom(x2, design, plot=FALSE)
+vfit <- lmFit(v, design)
+vfit <- contrasts.fit(vfit, contrasts=cont.matrix)
+```
+
+```{r}
+tfit <- treat(vfit, lfc=0.5)
+dt <- decideTests(tfit)
+summary(dt)
+results<-data.frame(dt)
+results$id<-rownames(results)
+DEGs<-results[results$LesVsNonLes!=0,]
+```
+
+#### 2.4 CQN of DEGs
+```{r}
+#Create two dataframe with raw counts, one for DEGs in lesional samples and one for DEGs in non-lesional samples
+gene_final<-data.frame(x$counts)
+count_AL<-gene_final[rownames(gene_final)%in% DEGs$id,sampleinfo2$group=="Lesional"]
+dim(count_AL)
+count_NL<-gene_final[rownames(gene_final)%in% DEGs$id,sampleinfo2$group=="Non_Lesional"]
+dim(count_NL)
+#Since lesional dataframe contains more samples than non.lesional one, I remove 3 columns in lesional dataframe
+count_AL<-count_AL[,1:54]
+```
+
+
+```{r}
+### This function takes in input an expression matrix with raw data and it calculates the matrix with CQN data
+
+cqn_data<-function(hsmart,raw_count){
+  library("cqn")
+  biomart2<- getBM(attributes=c('ensembl_gene_id','start_position','end_position', 'percentage_gene_gc_content'), filters = 'ensembl_gene_id', values =rownames(raw_count), mart = hsmart)   
+  biomart2$length<-biomart2$end_position-biomart2$start_position
+  gene_length_gc<-biomart2[,c(1,4,5)]
+  both <-rownames (raw_count)%in% gene_length_gc$ensembl_gene_id
+  raw_count<-raw_count[both==TRUE,]
+  cqn.subset<-cqn(raw_count,lengths=gene_length_gc$length,x=gene_length_gc$percentage_gene_gc_content)
+  normalized_data<-data.frame(cqn.subset$y+cqn.subset$offset)
+}
+
+```
+
+```{r}
+library("biomaRt")
+hsmart <- useMart(dataset = "hsapiens_gene_ensembl", biomart = "ensembl")
+normalized_count_AL<-cqn_data(hsmart,count_AL)
+normalized_count_NL<-cqn_data(hsmart,count_NL)
+```
+
+### 3 Correlation matrices
+I chose Biweight Midcorrelation as second non-linear score. It is median-based, rather than mean-based, thus is less sensitive to outliers, and can be a robust alternative to other similarity metrics, such as Pearson correlation or mutual information.
+
+This measure was used for a gene co-expression study in "Zheng, Chun-Hou, et al. "Gene differential coexpression analysis based on biweight correlation and maximum clique." BMC bioinformatics. Vol. 15. No. 15. BioMed Central, 2014." 
+The results explain that Biweight Midcorrelation is more robust for outliers than other methods.
+
+```{r}
+### This function takes in input a dataframe with NxN gene-gene interactions and it returns a daframe with a single row for each pair of gene anf the value of their correlation.
+
+flattenCorrMatrix <- function(cormat) {
+  ut <- upper.tri(cormat)
+  return(data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut]
+  ))
+}
+```
+
+
+```{r}
+### This function takes in input a dataframe with NxN gene-gene interactions. It first calculates the value of the correlation for each pair of genes for the 4 selected measures. Then, it uses "flattenCorrMatrix" function to obtain the dataframes wit a single row for each relationship and in the end, it combines all the scores in a single dataframe with 6 columns: gene1-gene2-kendall-pearson-NMI-bicor
+
+scores<-function(tab){
+  #### Kendall
+  kendall<-corr.test(t(tab),method="kendall",adjust="BH",ci=FALSE)
+  kendall<-flattenCorrMatrix(kendall$r)
+  kendall<-kendall[order(kendall$row),]
+  
+  #### Spearman
+  spearman<-corr.test(t(tab),method="spearman",adjust="BH",ci=FALSE)
+  spearman<-flattenCorrMatrix(spearman$r)
+  spearman<-spearman[order(spearman$row),]
+  
+  #### NMI
+  MI <- mutualInfoAdjacency(
+  t(tab),
+  discretizeColumns = T,
+  entropyEstimationMethod = "MM",
+  numberBins = NULL)
+
+  NMI <- MI$AdjacencySymmetricUncertainty
+  nmi<-flattenCorrMatrix(NMI)
+  nmi<-nmi[order(nmi$row),]
+
+  #### Biweight Midcorrelation
+  bicor<-bicorAndPvalue(t(tab), y=NULL)
+  bicor<-flattenCorrMatrix(bicor$bicor)
+  bicor<-bicor[order(bicor$row),]
+
+  scores<-data.frame("gene1"=kendall$row,"gene2"=kendall$column,"kendall"=kendall$cor,"spearman"=spearman$cor,"nmi"=nmi$cor,"bicor"=bicor$cor)
+
+  return(scores)
+}
+
+```
+
+### 4 Best thresholds
+
+```{r}
+### This function takes in input a dataframe with a row for each gene-gene correlation and one of the 4 columns between kendall, pearson, nmi and bicor. It returns the threshold that allows to obtain the network that better fits with a power-low distribution.
+
+best_thresholds<-function(net,start,end,bypass){
+  library("igraph")
+  Thrfits <- data.frame()
+
+  for (x in seq(start, end, bypass)) {
+    net <- delete.edges(net, E(net)[ abs(weight) < x ])
+    net <- delete.vertices(net, which(igraph::degree(net) < 1))
+    
+    if (sum(degree(net)) != 0) {
+      deg <- degree(net)
+      fit <- fit_power_law(deg)
+      
+      if( fit$KS.stat < 1){# I avoid infinite values with this.
+      Thrfits <- rbind(Thrfits, cbind(x, fit$KS.stat,fit$xmin))
+      #plot(net, vertex.label = NA, layout=layout.gem, vertex.size=5)
+      #title(as.character(x), sub = fit$KS.stat) ## internal titles        
+      }
+    
+    }
+  }
+  colnames(Thrfits) <- c("thr", "KS","xmin")
+  Thrfits<-Thrfits[Thrfits$xmin<20,]
+  Thrfits<-Thrfits[order(Thrfits$KS),]
+  return(Thrfits[1,1])
+  #return(Thrfits)
+}
+
+```
+
+```{r}
+LogLogThr2 <- function(net, start, end, bypass){
+  Freqs <- data.frame()
+  for (x in seq(start, end, bypass)) {
+    net <- delete.edges(net, E(net)[ abs(weight) < x ])
+    net <- delete.vertices(net, which(igraph::degree(net) < 1))
+    
+    if (sum(degree(net)) != 0) {
+      Freq <- as.data.frame(table(degree(net)))
+      colnames(Freq) <- c("degree", "AF")
+      Freq$degree <- as.numeric(Freq$degree)
+      Freq$RF <- Freq$AF / sum(Freq$AF)
+      Freq$Thr <- as.numeric(x)
+     
+      #Add linear model 
+      lmDeg <- lm(log(RF) ~ log(degree), data = Freq)
+      Freq$r <- summary(lmDeg)$adj.r.squared
+      Freqs <- rbind(Freqs, Freq)
+    }
+  }
+    Freqs<-Freqs[order(Freqs$r,decreasing = T),]
+    return(as.double(Freqs[1,4]))
+}
+```
+
+
+
+```{r}
+# This function creates a single dataframe with the best thresold for each method
+
+dataframe_best<-function(score){
+  best_th<-c()
+  for (i in 1:4){
+    values<-score[,c(1,2,i+2)]
+    colnames(values)[3]<-"weight"
+    HP <- graph_from_data_frame(values, directed=FALSE)
+    if(i==3){end=1}
+    else{end<-boxplot(abs(values$weight),plot=F)$stats[5,]}
+    best_th<-c(best_th,LogLogThr2(HP,0,end,0.1))
+  }
+  
+  best_thr<-data.frame(t(best_th))
+  colnames(best_thr)<-c("kendall","spearman","nmi","bicor")
+  return(best_thr)
+}
+```
+
+### 5. TRUE/FALSE combinations
+
+```{r}
+### This function creates the dataframe with all the possible combinations with at lest one TRUE
+
+create_all_comb<-function(){
+  all_comb<-data.frame(
+    (c(T,T,T,T)),(c(T,T,T,F)),(c(T,T,F,T)),
+    (c(T,F,T,T)),(c(F,T,T,T)),(c(T,T,F,F)),
+    (c(T,F,T,F)),(c(T,F,F,T)),(c(F,T,T,F)),
+    (c(F,T,F,T)),(c(F,F,T,T)),(c(T,F,F,F)),
+    (c(F,T,F,F)),(c(F,F,T,F)),(c(F,F,F,T))
+  )
+  all_comb<-data.frame(t(all_comb))
+  rownames(all_comb)<-c("K.S.N.B","K.S.N","K.S.B","K.N.B","S.N.B","K.S","K.N","K.B","S.N","S.B","N.B","K","S","N","B")
+  colnames(all_comb)<-c("kendall","spearman","NMI","Bicor")
+  return(all_comb)
+}
+```
+
+
+### 6. Validation with STRING
+
+```{r}
+# This function converts the gene_id in String_id 
+
+id_conversion<-function(my_data){
+  library("STRINGdb")
+  string_db <- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  scores_mapped <- string_db$map(my_data, c("gene1"), removeUnmappedRows = TRUE)
+  colnames(scores_mapped)[7]<-"String1"
+  scores_mapped <- string_db$map(scores_mapped, "gene2", removeUnmappedRows = TRUE)
+  colnames(scores_mapped)[8]<-"String2"
+
+  scores_mapped<-scores_mapped[,c(7,8,3,4,5,6)]
+  return(scores_mapped)
+}
+```
+
+```{r}
+# This function takes in input all the possible TRUE/FALSE combinations and calculate the average of the TRUE values for each pair of genes
+
+avg_values<-function(network_mapped, all_comb){
+  data_abs<-network_mapped[,c(1,2)]
+  data_abs[,c(3,4,5,6)]<-abs(network_mapped[,c(3,4,5,6)])
+  for (k in 1:15){
+    True_index<-which( as.character(all_comb[k,]) %in% T)
+    True_index<-True_index+2
+    if(length(True_index)>1){network_mapped[,k+7]<-rowMeans(data_abs[,True_index])}
+    else{network_mapped[,k+7]<-data_abs[,True_index]}
+    }
+  
+  for (i in 1:15){
+    colnames(network_mapped)[i+7]<-rownames(all_comb)[i]
+  } 
+  return(network_mapped)
+}
+```
+
+
+```{r}
+# This function prints the roc curves and calculates the auroc values for each combination 
+
+roc_and_auroc<-function(network_mapped,all_comb){
+  col <-rainbow(4)
+  col_graph<-c(col[1],rep(col[2],4),rep(col[3],6),rep(col[4],4))
+  auroc_data<-c()
+  for (i in 1:15){
+    roc_<-roc(network_mapped$diagnostic,network_mapped[,i+7])
+    if (i==1){plot.roc(roc_, col=col_graph[i])}
+    else{lines.roc(roc_,col=col_graph[i])}
+    auroc_data<-c(auroc_data,auc(roc_))
+  }
+  legend("bottomright", legend=row.names(all_comb), col=col_graph, lwd=2)
+  return(data.frame("pred"=row.names(all_comb),"number"=c(4,rep(3,4),rep(2,6),rep(1,4)),"auroc"=auroc_data))
+}
+```
+
+
+```{r}
+# This function combines the previous functions into one. It returns a single list with 4 elements: a dataframe with the correlation values, a dataframe with the 4 best thresolds, a dataframe with the converted IDs and the average values for each combination and the final dataframe with auroc values of each combination
+
+total<-function(normalized_count){
+  # Scores calculation
+  data_score<-scores(normalized_count)
+  
+  #Best_Thresholds
+  dataframe_best_th<-dataframe_best(data_score)
+  
+  # IDs conversion
+  score_converted<-id_conversion(data_score)
+  
+  # Importing STRING
+  string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+  string<-string[string$coexpression>0,c(1,2,6)]
+  
+  # GS creation and comparison with my data
+  GS <- string[string$protein1 %in% score_converted$String1 & string$protein2 %in% score_converted$String2,]
+  
+  #Diagnostic column
+  #score_converted$check <- ifelse(is.na(match(paste0(score_converted$String1, score_converted$String2),paste0(GS$protein1, GS$protein2))), FALSE, TRUE)
+  library("tidyr")
+  GS <- GS[order(as.character(GS$protein1, GS$protein2)),] %>% unite("rel", protein1:protein2, na.rm = TRUE, remove = FALSE)
+  score_converted<-score_converted[order(as.character(score_converted$String1, score_converted$String2)),] %>% unite("rel", String1:String2, na.rm = TRUE, remove = FALSE)
+
+  score_converted$diagnostic<-score_converted$rel %in% GS$rel
+  score_converted$rel<-NULL
+  
+  ### This daframe shows all the possible combinations with at lest one TRUE
+  all_comb<-create_all_comb()
+
+  # Average values of the TRUE values for each combination
+  score_converted<-avg_values(score_converted,all_comb)
+  
+  # ROC curves and auroc values
+  auroc_<-roc_and_auroc(score_converted,all_comb)
+  return(list("score"=data_score,"best_th"=dataframe_best_th,"converted"=score_converted,"auroc"=auroc_))
+}
+```
+
+#### 6. ROC CURVES and AUROC BOXPLOT
+
+```{r}
+# This function divides auroc values based on the number of classifiers in the combination (4,3,2,1) and it prints the boxplots
+
+data_boxplot<-function(auroc1,auroc2){
+  merge_df<-rbind(auroc1,auroc2)
+  data4<-merge_df[merge_df$number==4,]$auroc
+  data3<-merge_df[merge_df$number==3,]$auroc
+  data2<-merge_df[merge_df$number==2,]$auroc
+  data1<-merge_df[merge_df$number==1,]$auroc
+  results<-list("4"=data4,"3"=data3,"2"=data2,"1"=data1)
+  windows(width=12, height=8)
+  boxplot(results,col=brewer.pal(n=4,name="Set1"),xlab="Number of classifiers",ylab="auROC",ylim=c(0.55,0.565),cex.axis=2,cex.lab=2)
+  
+  best_median<-data.frame("classifier"=c(4,3,2,1),"median"=c(median(data4),median(data3),median(data2),median(data1)))
+  best_median<-best_median[order(best_median$median,decreasing=T),]
+  return(best_median)
+}
+
+```
+
+```{r}
+total_lesional<-total(normalized_count_AL)
+total_nonlesional<-total(normalized_count_NL)
+final<-data_boxplot(first_lesional_result$auroc,first_nonlesional_result$auroc)
+final
+### The first row of "final" dataframe contains the best number of classifiers
+best_classifier<-final[1,1]
+```
+
+### 7. Identify the pairs of genes that belong to the best combination
+
+```{r}
+### This function takes in input the dataframe with the score and the one with the value of the best thresholds.The output is a new dataframe with a row for each gene-gene relationship with 6 column gene1-gene2-kendall-spearma-NMI-bicor. The last 4 column contains TRUE/FALSE if the score is above or not the best threshold.
+
+TrueAndFalse<-function(tab,best_thr){
+  trueandfalse<-tab[,c(1,2)]
+  trueandfalse$kendall<-ifelse(abs(tab$kendall)>=best_thr[1,1],T,F)
+  trueandfalse$spearman<-ifelse(abs(tab$spearman)>=best_thr[1,2],T,F)
+  trueandfalse$nmi<-ifelse(abs(tab$nmi)>=best_thr[1,3],T,F)
+  trueandfalse$bicor<-ifelse(abs(tab$bicor)>=best_thr[1,4],T,F)
+  
+  return(trueandfalse)
+}
+```
+
+```{r}
+### This functon takes in input the scores, the best thresholds and the best_classifier. It produces two dataframes as output. Both these 2 dataframes contain only the pairs of genes that belong to te best combination. One dataframe contains the scores and the the second contain TRUE/FALSE values to specify which measures are over the best thresholds.
+
+extract_interaction<-function(score,best_th,best_comb){
+  Over<-TrueAndFalse(score,best_th)
+  Over$nT<-(Over$nmi + Over$kendall + Over$spearman + Over$bicor)
+  final_bool<-Over[Over$nT==best_comb,]
+  final_score<-score[is.na(match(paste0(score$gene1,score$gene2),paste0(final_bool$gene1, final_bool$gene2)))==F,]
+  final_list<-list("score"=final_score,"boolean"=final_bool)
+  
+  return(final_list)
+}
+
+```
+
+```{r}
+final_lesional<-extract_interaction(total_lesional$score,prova,best_classifier)
+final_non_lesional<-extract_interaction(total_nonlesional$score,prova2,best_classifier)
+write.csv(final_lesional$score,"extracted_score_lesional")
+write.csv(final_lesional$boolean,"extracted_bool_lesional")
+write.csv(final_non_lesional$score,"extracted_score_non_lesional")
+write.csv(final_non_lesional$boolean,"extracted_bool_non_lesional")
+
+```
+
+
+
+```{r}
+write.csv(normalized_count_AL,file="normalized_count_AL")
+write.csv(normalized_count_NL,file="normalized_count_NL")
+
+write.table(normalized_count_AL, "normalized_count_AL.txt", sep = '\t', quote = FALSE, row.names = TRUE, col.names = TRUE)
+write.table(normalized_count_NL, "normalized_count_NL.txt", sep = '\t', quote = FALSE, row.names = TRUE, col.names = TRUE)
+```
+
+
+
+
+
+```{r}
+par(mfrow=c(2,2))
+n<-2
+hist(degree(graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$kendall)>first_lesional_result$best_th$kendall,c(1,2,3)],directed=F)),breaks=10,freq=F,ylab="",xlab = "Degree",main="Kendall",cex.lab=n-0.5,cex.axis=n,cex.main=n)
+lines(density(degree(graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$kendall)>first_lesional_result$best_th$kendall,c(1,2,3)],directed=F)),bw=3),col="red",lwd=2)
+
+hist(degree(graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$spearman)>first_lesional_result$best_th$spearman,c(1,2,4)],directed=F)),breaks=10,freq=F,ylab="",xlab = "Degree",main="Spearman",cex.lab=n-0.5,cex.axis=n,cex.main=n)
+lines(density(degree(graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$spearman)>first_lesional_result$best_th$spearman,c(1,2,4)],directed=F)),bw=3),col="red",lwd=2)
+
+hist(degree(graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$nmi)>first_lesional_result$best_th$nmi,c(1,2,5)],directed=F)),breaks=10,freq=F,ylab="",xlab = "Degree",main="NMI",cex.lab=n-0.5,cex.axis=n,cex.main=n)
+lines(density(degree(graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$nmi)>first_lesional_result$best_th$nmi,c(1,2,5)],directed=F)),bw=3),col="red",lwd=2)
+
+hist(degree(graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$bicor)>first_lesional_result$best_th$bicor,c(1,2,6)],directed=F)),breaks=10,freq=F,ylab="",xlab = "Degree",main="Bicor",cex.lab=n-0.5,cex.axis=n,cex.main=n)
+lines(density(degree(graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$bicor)>first_lesional_result$best_th$bicor,c(1,2,6)],directed=F)),bw=3),col="red",lwd=2)
+
+
+```
+
+```{r}
+library("RColorBrewer")
+BiocManager::install("autoimage")
+library("autoimage")
+reset.par()
+prova<-brewer.pal(n=2,name="Set2")
+
+par(mfrow=c(1,2))
+plot(density(abs(E(first_les_graph)$weight)),main="Lesional",xlab="Abs(weight)",col=prova[1],lwd=3, cex.lab=1.5, cex.axis=1.5, cex.main=1.5, cex.sub=1.5)
+lines(density(abs(E(second_les_graph)$weight)),col=prova[2],lwd=3)
+abline(v=median(abs(E(first_les_graph)$weight)),col=prova[1],lty=2,lwd=2)
+abline(v=median(abs(E(second_les_graph)$weight)),col=prova[2],lty=2,lwd=2)
+
+plot(density(abs(E(first_Nles_graph)$weight)),main="Non-Lesional",xlab="Abs(weight)",col=prova[1],lwd=3,cex.lab=1.5, cex.axis=1.5, cex.main=1.5, cex.sub=1.5)
+lines(density(abs(E(second_Nles_graph)$weight)),col=prova[2],lwd=3)
+abline(v=median(abs(E(first_Nles_graph)$weight)),col=prova[1],lty=2,lwd=2)
+abline(v=median(abs(E(second_Nles_graph)$weight)),col=prova[2],lty=2,lwd=2)
+#legend("topright",legend=c("first optimization","second optimization"), col=prova,cex=1, lwd=1,xjust=1)
+```
+
+
+```{r}
+group<-function(net){
+  #library("visNetwork")
+  library("igraph")
+  memb<-components(net,mode="weak")
+  node<-data.frame(memb$membership)
+  node$id<-rownames(node)
+  node$label<-node$id
+  colnames(node)[1]<-"group"
+  #edges<-as_data_frame(net,what="edges")
+  freq_clust<-data.frame(table(node$group))
+  freq_clust<-freq_clust[order(freq_clust$Freq,decreasing = T),]
+  freq_clust$Var1<-as.numeric(freq_clust$Var1)
+  main<-freq_clust[1,1]
+  
+  return(node[node$group==main,])
+
+}
+
+write.csv(group(third_Nles_graph),"Nles_cl1")
+```
+
+
+
+
+
+```{r}
+third_summary
+
+pp<-data.frame("network"=c("Hyper-connected","Hyper-connected","Ensemble","Ensemble","Pruning","Pruning","Final","Final"),"condition"=c("Les","Non-Les","Les","Non-Les","Les","Non-Les","Les","Non-Les"),"Nodes"=c(677,677,298,260,298,260,298,260),"edges"=c(228826,228826,1071,815,272,234,430,359))
+
+pn<-data.frame("network"=c(rep("Hyper-connected",2),rep("Hyper-connected",2),rep("Ensemble",2),rep("Ensemble",2),rep("Pruned",2),rep("Pruned",2),rep("Final",2),rep("Final",2)),"condition"=c(rep(c("LES","LES","N-LES","N-LES"),4)),attribute=rep(c("nodes","edges"),8),"value"=c(677,228826,677,228826,298,1071,260,815,298,272,260,234,298,430,260,359))
+pn$network<-factor(pn$network,levels=c("Hyper-connected","Ensemble","Pruned","Final"))
+
+prova<-c()
+for (i in 1:16){
+  if(i%%2==1){prova<-c(prova,pn[i,4]/2)}
+  else{prova<-c(prova,pn[i,4]+pn[i-1,4]+1000)}
+}
+
+pn$y_pos<-prova
+
+library("ggplot2")
+ggplot(pn, aes(fill=attribute, y=value, x=condition)) + 
+    geom_bar(position="stack", stat="identity") + geom_text(aes(y=y_pos*0.8,label=value),vjust=1.3,size=6) + ylim(c(0,20)) + facet_grid(~ network) + theme(text = element_text(size = 30)) + scale_fill_brewer(palette="Paired")
+
+ggplot(pn, aes(fill=attribute, y=value, x=condition))  + geom_bar(position="stack", stat="identity")+scale_y_continuous(trans = "log10")+
+  geom_text(aes(y=y_pos*0.8,label=value),vjust=1.3,size=6)  +facet_grid(~ network) + theme(text = element_text(size = 25)) + scale_fill_brewer(palette="Paired")
+```
+
+```{r}
++ geom_text(aes(y=y_pos*0.8,label=value),vjust=1.3,size=6)
+```
+
+
+
+```{r}
+library("RColorBrewer")
+coll<-brewer.pal(n=3,name="Set1")
+gl<-list("Ensemble"=abs(E(first_les_graph)$weight),"Pruned"=abs(E(second_les_graph)$weight),"Final"=abs(E(third_les_graph)$weight))
+gnl<-list("Ensemble"=abs(E(first_Nles_graph)$weight),"Pruned"=abs(E(second_Nles_graph)$weight),"Final"=abs(E(third_Nles_graph)$weight))
+par(mfrow=c(1,2))
+boxplot(gl,main="Lesional",cex.main=2,cex.axis=1.5,col=coll[1])
+boxplot(gnl,main="Non-Lesional",cex.main=2,cex.axis=1.5,col=coll[2])
+
+
+
+gp<-list("Ensemble"=abs(E(first_les_graph)$weight),"Ensemble"=abs(E(first_Nles_graph)$weight),"Pruned"=abs(E(second_les_graph)$weight),"Pruned"=abs(E(second_Nles_graph)$weight),"Final"=abs(E(third_les_graph)$weight),"Final"=abs(E(third_Nles_graph)$weight))
+boxplot(gp,col=rep(c(coll[1],coll[2]),3),cex.main=2,cex.axis=1.2)
+esquisse::esquisser()
+
+df<-data.frame(List=unlist(gp),Group=rep(c("Ensemble","Pruned","Final"),times=c(1886,506,789)),Condition=c(rep("AL",1071),rep("AN",815),rep("AL",272),rep("AN",234),rep("AL",430),rep("AN",359)))
+df$Group<-factor(df$Group,levels=c("Ensemble","Pruned","Final"))
+
+esquisse::esquisser()
+
+
+library(ggplot2)
+
+ggplot(df) +
+ aes(x = Condition, y = List, fill = Condition) +
+ geom_boxplot(shape = "circle") +
+ scale_fill_hue(direction = 1) +
+ labs(y = "Weights") +
+ theme_minimal() + theme(text = element_text(size = 30),axis.text.x=element_blank(),axis.title.x=element_blank(),axis.ticks.x=element_blank())+
+ facet_grid(~ Group)
+```
+
+
+```{r}
+windows(width=10, height=8)
+par(mfrow=c(2,2))
+boxplot(abs(first_lesional_result$score$kendall),main="Kendall",cex.lab=2.5,cex.axis=2.5,cex.main=2.5)
+boxplot(abs(first_lesional_result$score$spearman),main="Spearman",cex.lab=2.5,cex.axis=2.5,cex.main=2.5)
+boxplot(abs(first_lesional_result$score$nmi),main="NMI",cex.lab=2.5,cex.axis=2.5,cex.main=2.5)
+boxplot(abs(first_lesional_result$score$bicor),main="Bicor",cex.lab=2.5,cex.axis=2.5,cex.main=2.5)
+
+median(degree(second_les_graph))
+mean(degree(second_les_graph))
+median(degree(second_Nles_graph))
+mean(degree(second_Nles_graph))
+```
+
+```{r}
+par(mfrow=c(2,2))
+boxplot(abs(first_lesional_result$score$kendall))
+```
+
+
+
+```{r}
+pn<-data.frame("network"=c(rep("Kendall",2),rep("Kendall",2),rep("Spearman",2),rep("Spearman",2),rep("NMI",2),rep("NMI",2),rep("Bicor",2),rep("Bicor",2),rep("EnGNet_1",2),rep("EnGNet_1",2),rep("EnGNet_2",2),rep("EnGNet_2",2)),"condition"=c(rep(c("LES","LES","N-LES","N-LES"),6)),attribute=rep(c("nodes","edges"),12),"value"=c(465,4249,592,9718,424,3389,517,6238,435,1541,355,1014,420,3067,522,6079,438,426,527,520,298,430,260,359))
+pn$network<-factor(pn$network,levels=c("Kendall","Spearman","NMI","Bicor","EnGNet_1","EnGNet_2"))
+
+prova<-c()
+for (i in 1:24){
+  if(i%%2==1){prova<-c(prova,pn[i,4]/2)}
+  else{prova<-c(prova,pn[i,4]+pn[i-1,4]+1000)}
+}
+
+pn$y_pos<-prova
+
+library("ggplot2")
+ggplot(pn, aes(fill=attribute, y=value, x=condition)) + 
+    geom_bar(position="stack", stat="identity") + scale_y_continuous(trans = "log10")+ geom_text(aes(y=y_pos*0.8,label=value),vjust=1.3,size=6)  + facet_grid(~ network) + theme(text = element_text(size = 20)) + scale_fill_brewer(palette="Paired")
+
+ggplot(pn, aes(fill=attribute, y=value, x=condition))  + geom_bar(position="stack", stat="identity")+scale_y_continuous(trans = "log10")+
+  geom_text(aes(y=y_pos*0.8,label=value),vjust=1.3,size=6)  +facet_grid(~ network) + theme(text = element_text(size = 25)) + scale_fill_brewer(palette="Paired")
+```
+
+
+
+```{r}
+pn<-data.frame("network"=c(rep("Kendall",2),rep("Kendall",2),rep("Spearman",2),rep("Spearman",2),rep("NMI",2),rep("NMI",2),rep("Bicor",2),rep("Bicor",2),rep("EnGNet_1",2),rep("EnGNet_1",2),rep("EnGNet_2",2),rep("EnGNet_2",2)),"condition"=c(rep(c("LES","LES","N-LES","N-LES"),6)),attribute=rep(c("AUC_les","R^2_les","AUC_Nles","R^2_Nles"),6),"value"=c(0.5048,0.7468,0.5246,0.7521,0.5163,0.7504,0.5033,0.7280,0.5391,0.8967,0.5389,0.8636,0.5253,0.8142,0.4968,0.7164,0.5008,0.9692,0.5650,0.9378,0.6830,0.9169,0.6511,0.9082))
+pn$network<-factor(pn$network,levels=c("Kendall","Spearman","NMI","Bicor","EnGNet_1","EnGNet_2"))
+
+prova<-c()
+for (i in 1:24){
+  if(i%%2==1){prova<-c(prova,pn[i,4]/2)}
+  else{prova<-c(prova,pn[i,4]+pn[i-1,4])}
+}
+
+pn$y_pos<-prova
+
+library("ggplot2")
+ggplot(pn, aes(fill=attribute, y=value, x=attribute)) +
+  geom_bar(position="stack", stat="identity")   + facet_grid(~ network) + theme(text = element_text(size = 20),axis.text.x=element_blank(),axis.title.x=element_blank(),axis.ticks.x=element_blank()) + scale_fill_brewer(palette="Paired")
+
+ggplot(pn, aes(fill=attribute, y=value, x=condition))  + geom_bar(position="stack", stat="identity")+scale_y_continuous(trans = "log10")+
+  geom_text(aes(y=y_pos*0.8,label=value),vjust=1.3,size=6)  +facet_grid(~ network) + theme(text = element_text(size = 25)) + scale_fill_brewer(palette="Paired")
+```
+
+
+```{r}
+auc_data<-data.frame("Networks"=c("Ensemble","Ensemble","Pruned","Pruned","Final","Final"),"Condition"=rep(c("AL","AN"),3),"AUC"=c(0.580,0.537,0.538,0.547,0.683,0.651))
+auc_data$Networks<-factor(auc_data$Networks,levels=c("Ensemble","Pruned","Final"))
+
+ggplot(auc_data, aes(fill=Condition, y=AUC, x=Condition))  + geom_bar(position="stack", stat="identity")+ geom_text(aes(label=AUC),vjust=-0.5,size=8)+
+ facet_grid(~ Networks) + theme(text = element_text(size = 30),axis.text.x=element_blank(),axis.title.x=element_blank(),axis.ticks.x=element_blank()) + scale_fill_brewer(palette="Paired")
+```
+
+
+
+
+
+```{r}
+hub_les<-data.frame(degree(third_les_graph))
+colnames(hub_les)<-c("degree")
+hub_les<-hub_les[order(hub_les$degree,decreasing = T),,drop=F]
+
+hub_Nles<-data.frame(degree(third_Nles_graph))
+colnames(hub_Nles)<-c("degree")
+hub_Nles<-hub_Nles[order(hub_Nles$degree,decreasing = T),,drop=F]
+
+
+zub_les<-data.frame(degree(second_les_graph))
+colnames(zub_les)<-c("degree")
+zub_les<-zub_les[order(zub_les$degree,decreasing = T),,drop=F]
+
+zub_Nles<-data.frame(degree(second_Nles_graph))
+colnames(zub_Nles)<-c("degree")
+zub_Nles<-zub_Nles[order(zub_Nles$degree,decreasing = T),,drop=F]
+
+```
+
+```{r}
+prova<-graph_from_data_frame(first_lesional_result$score[abs(first_lesional_result$score$kendall)>first_lesional_result$best_th$kendall,c(1,2,3)],directed=F)
+V(prova)$color="#E70426 "
+visIgraph(prova)
+
+prova<-graph_from_data_frame(first_lesional_result$score[,c(1,2,3)],directed=F)
+V(prova)$color="red"
+visIgraph(prova,layout = "layout_in_circle")
+
+V(first_Nles_graph)$color="green"
+visIgraph(third_Nles_graph)
+```
+
+
+

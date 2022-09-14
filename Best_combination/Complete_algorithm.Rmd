@@ -1,0 +1,685 @@
+---
+title: "From normalized to final"
+author: "Tommaso Becchi"
+date: "14/5/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+### LIBRARIES
+```{r}
+library("GEOquery")
+library(dplyr)
+library("limma")
+library("edgeR")
+library("psych")
+library("knitr")
+library("pROC")
+library("minet")
+library("entropy")
+library("WGCNA")
+library("infotheo")
+library("igraph")
+library("tidyr")
+library("STRINGdb")
+library("visNetwork")
+```
+
+
+### 0. INPUT DATA (CQN NORMALIZED DEGs COUNT)
+```{r}
+normalized_count_AL<-read.csv("normalized_count_AL",row.names = 1)
+normalized_count_NL<-read.csv("normalized_count_NL",row.names = 1)
+```
+
+### 1.1 SCORES
+```{r}
+flattenCorrMatrix <- function(cormat) {
+  ut <- upper.tri(cormat)
+  return(data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut]
+  ))
+}
+```
+
+```{r}
+scores<-function(tab){
+  #### Kendall
+  kendall<-corr.test(t(tab),method="kendall",adjust="BH",ci=FALSE)
+  kendall<-flattenCorrMatrix(kendall$r)
+  kendall<-kendall[order(kendall$row),]
+  
+  #### Spearman
+  spearman<-corr.test(t(tab),method="spearman",adjust="BH",ci=FALSE)
+  spearman<-flattenCorrMatrix(spearman$r)
+  spearman<-spearman[order(spearman$row),]
+  
+  #### NMI
+  MI <- mutualInfoAdjacency(
+  t(tab),
+  discretizeColumns = T,
+  entropyEstimationMethod = "MM",
+  numberBins = NULL)
+
+  NMI <- MI$AdjacencySymmetricUncertainty
+  nmi<-flattenCorrMatrix(NMI)
+  nmi<-nmi[order(nmi$row),]
+
+  #### Biweight Midcorrelation
+  bicor<-bicorAndPvalue(t(tab), y=NULL)
+  bicor<-flattenCorrMatrix(bicor$bicor)
+  bicor<-bicor[order(bicor$row),]
+
+  scores<-data.frame("gene1"=kendall$row,"gene2"=kendall$column,"kendall"=kendall$cor,"spearman"=spearman$cor,"nmi"=nmi$cor,"bicor"=bicor$cor)
+
+  return(scores)
+}
+```
+
+### 1.2 BEST TOPOLOGICAL TH (LOG-LOG)
+```{r}
+LogLogThr2 <- function(net, start, end, bypass){
+  Freqs <- data.frame()
+  for (x in seq(start, end, bypass)) {
+    net <- delete.edges(net, E(net)[ abs(weight) < x ])
+    net <- delete.vertices(net, which(igraph::degree(net) < 1))
+    
+    if (sum(degree(net)) != 0) {
+      Freq <- as.data.frame(table(degree(net)))
+      colnames(Freq) <- c("degree", "AF")
+      Freq$degree <- as.numeric(Freq$degree)
+      Freq$RF <- Freq$AF / sum(Freq$AF)
+      Freq$Thr <- as.numeric(x)
+     
+      #Add linear model 
+      lmDeg <- lm(log(RF) ~ log(degree), data = Freq)
+      Freq$r <- summary(lmDeg)$adj.r.squared
+      Freqs <- rbind(Freqs, Freq)
+    }
+  }
+    Freqs<-Freqs[order(Freqs$r,decreasing = T),]
+    return(as.double(Freqs[1,4]))
+}
+```
+
+```{r}
+dataframe_best<-function(score){
+  best_th<-c()
+  for (i in 1:4){
+    values<-score[,c(1,2,i+2)]
+    colnames(values)[3]<-"weight"
+    HP <- graph_from_data_frame(values, directed=FALSE)
+    if(i==3){end=1}
+    else{end<-boxplot(abs(values$weight),plot=F)$stats[5,]}
+    best_th<-c(best_th,LogLogThr2(HP,0,end,0.1))
+  }
+  
+  best_thr<-data.frame(t(best_th))
+  colnames(best_thr)<-c("kendall","spearman","nmi","bicor")
+  return(best_thr)
+}
+```
+
+### 1.3 ID CONVERSION
+```{r}
+id_conversion<-function(my_data){
+  string_db <- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  n_columns<-(dim(my_data)[2])
+  scores_mapped <- string_db$map(my_data, c("gene1"), removeUnmappedRows = TRUE)
+  colnames(scores_mapped)[n_columns+1]<-"String1"
+  scores_mapped <- string_db$map(scores_mapped, "gene2", removeUnmappedRows = TRUE)
+  colnames(scores_mapped)[n_columns+2]<-"String2"
+
+  scores_mapped<-scores_mapped[,c(n_columns+1,n_columns+2,3:n_columns)]
+  return(scores_mapped)
+}
+```
+
+### 1.4 T/F COMBINATIONS + AVG(TRUE)
+
+```{r}
+create_all_comb<-function(){
+  all_comb<-data.frame(
+    (c(T,T,T,T)),(c(T,T,T,F)),(c(T,T,F,T)),
+    (c(T,F,T,T)),(c(F,T,T,T)),(c(T,T,F,F)),
+    (c(T,F,T,F)),(c(T,F,F,T)),(c(F,T,T,F)),
+    (c(F,T,F,T)),(c(F,F,T,T)),(c(T,F,F,F)),
+    (c(F,T,F,F)),(c(F,F,T,F)),(c(F,F,F,T))
+  )
+  all_comb<-data.frame(t(all_comb))
+  rownames(all_comb)<-c("K.S.N.B","K.S.N","K.S.B","K.N.B","S.N.B","K.S","K.N","K.B","S.N","S.B","N.B","K","S","N","B")
+  colnames(all_comb)<-c("kendall","spearman","NMI","Bicor")
+  return(all_comb)
+}
+```
+
+```{r}
+avg_values<-function(network_mapped, all_comb){
+  data_abs<-network_mapped[,c(1,2)]
+  data_abs[,c(3,4,5,6)]<-abs(network_mapped[,c(3,4,5,6)])
+  for (k in 1:15){
+    True_index<-which( as.character(all_comb[k,]) %in% T)
+    True_index<-True_index+2
+    if(length(True_index)>1){network_mapped[,k+7]<-rowMeans(data_abs[,True_index])}
+    else{network_mapped[,k+7]<-data_abs[,True_index]}
+    }
+  
+  for (i in 1:15){
+    colnames(network_mapped)[i+7]<-rownames(all_comb)[i]
+  } 
+  return(network_mapped)
+}
+```
+
+### 1.5 STRING VALIDATION
+
+
+```{r}
+# This function prints the roc curves and calculates the auroc values for each combination 
+
+roc_and_auroc<-function(network_mapped,all_comb){
+  col <-rainbow(4)
+  col_graph<-c(col[1],rep(col[2],4),rep(col[3],6),rep(col[4],4))
+  auroc_data<-c()
+  for (i in 1:15){
+    roc_<-roc(network_mapped$diagnostic,network_mapped[,i+7])
+    if (i==1){plot.roc(roc_, col=col_graph[i])}
+    else{lines.roc(roc_,col=col_graph[i])}
+    auroc_data<-c(auroc_data,auc(roc_))
+  }
+  legend("bottomright", legend=row.names(all_comb), col=col_graph, lwd=2)
+  return(data.frame("pred"=row.names(all_comb),"number"=c(4,rep(3,4),rep(2,6),rep(1,4)),"auroc"=auroc_data))
+}
+```
+
+```{r}
+first_part_total<-function(normalized_count){
+  # Scores calculation
+  data_score<-scores(normalized_count)
+  
+  #Best_Thresholds
+  dataframe_best_th<-dataframe_best(data_score)
+  
+  # IDs conversion
+  score_converted<-id_conversion(data_score)
+  
+  # Importing STRING
+  string<-read.table("string_homosapiens.txt",sep=" ",header=T)
+  string<-string[string$coexpression>0,c(1,2,6)]
+  
+  # GS creation and comparison with my data
+  GS <- string[string$protein1 %in% score_converted$String1 & string$protein2 %in% score_converted$String2,]
+  
+  #Diagnostic column
+  #score_converted$check <- ifelse(is.na(match(paste0(score_converted$String1, score_converted$String2),paste0(GS$protein1, GS$protein2))), FALSE, TRUE)
+  GS <- GS[order(as.character(GS$protein1, GS$protein2)),] %>% unite("rel", protein1:protein2, na.rm = TRUE, remove = FALSE)
+  score_converted<-score_converted[order(as.character(score_converted$String1, score_converted$String2)),] %>% unite("rel", String1:String2, na.rm = TRUE, remove = FALSE)
+
+  score_converted$diagnostic<-score_converted$rel %in% GS$rel
+  score_converted$rel<-NULL
+  
+  ### This daframe shows all the possible combinations with at lest one TRUE
+  all_comb<-create_all_comb()
+
+  # Average values of the TRUE values for each combination
+  score_converted<-avg_values(score_converted,all_comb)
+  
+  # ROC curves and auroc values
+  auroc_<-roc_and_auroc(score_converted,all_comb)
+  return(list("score"=data_score,"best_th"=dataframe_best_th,"converted"=score_converted,"auroc"=auroc_,"GS"=GS))
+}
+```
+
+### 1.6 LES + N_LES COMBINED
+
+```{r}
+data_boxplot<-function(auroc1,auroc2){
+  merge_df<-rbind(auroc1,auroc2)
+  data4<-merge_df[merge_df$number==4,]$auroc
+  data3<-merge_df[merge_df$number==3,]$auroc
+  data2<-merge_df[merge_df$number==2,]$auroc
+  data1<-merge_df[merge_df$number==1,]$auroc
+  results<-list("4"=data4,"3"=data3,"2"=data2,"1"=data1)
+  boxplot(results,col=rainbow(4),xlab="Number of classifiers",ylab="auROC",ylim=c(0.545,0.565))
+  
+  best_median<-data.frame("classifier"=c(4,3,2,1),"median"=c(median(data4),median(data3),median(data2),median(data1)))
+  best_median<-best_median[order(best_median$median,decreasing=T),]
+  return(best_median)
+}
+
+```
+
+```{r warning=FALSE}
+first_lesional_result<-first_part_total(normalized_count_AL)
+first_nonlesional_result<-first_part_total(normalized_count_NL)
+first_auroc_combined<-data_boxplot(first_lesional_result$auroc,first_nonlesional_result$auroc)
+first_auroc_combined
+### The first row of "final" dataframe contains the best number of classifiers
+first_best_classifier<-first_auroc_combined[1,1]
+GS<-first_lesional_result$GS
+```
+
+### 1.7 OVERT TH
+
+```{r}
+TrueAndFalse<-function(tab,best_thr){
+  trueandfalse<-tab[,c(1,2)]
+  trueandfalse$kendall<-ifelse(abs(tab$kendall)>=best_thr[1,1],T,F)
+  trueandfalse$spearman<-ifelse(abs(tab$spearman)>=best_thr[1,2],T,F)
+  trueandfalse$nmi<-ifelse(abs(tab$nmi)>=best_thr[1,3],T,F)
+  trueandfalse$bicor<-ifelse(abs(tab$bicor)>=best_thr[1,4],T,F)
+  
+  return(trueandfalse)
+}
+```
+
+```{r}
+extract_interaction<-function(score,best_th,best_comb){
+  Over<-TrueAndFalse(score,best_th)
+  Over$nT<-(Over$nmi + Over$kendall + Over$spearman + Over$bicor)
+  final_bool<-Over[Over$nT==best_comb,]
+  final_score<-score[is.na(match(paste0(score$gene1,score$gene2),paste0(final_bool$gene1, final_bool$gene2)))==F,]
+  final_list<-list("score"=final_score,"bool"=final_bool)
+  
+  return(final_list)
+}
+```
+
+
+```{r}
+first_opt_les<-extract_interaction(first_lesional_result$score,first_lesional_result$best_th,first_best_classifier)
+first_opt_Nles<-extract_interaction(first_nonlesional_result$score,first_nonlesional_result$best_th,first_best_classifier)
+first_opt_les$bool$nT<-NULL
+first_opt_Nles$bool$nT<-NULL
+```
+
+
+### 2.1 GRAPH CREATION WITH AVG_TRUE
+
+```{r}
+# This function prints a graph using VisNetwork package
+vis_graph<-function(g){
+  nodes<-data.frame("id"=V(g)$name)
+  edges<-data.frame(get.edgelist(g))
+  colnames(edges)<-c("from","to")
+  visNetwork(nodes,edges,height = "700px", width = "100%")
+}
+```
+
+```{r}
+create_graph<-function(score,bool){
+  score$sign<-ifelse(score$kendall*score$spearman*score$nmi*score$bicor>0,1,-1)
+  data_abs<-score[,c(1,2)]
+  data_abs[,c(3,4,5,6)]<-abs(score[,c(3,4,5,6)])
+  
+  data_abs$kendall2<-ifelse(bool$kendall==T,data_abs$kendall,NA)
+  data_abs$spearman2<-ifelse(bool$spearman==T,data_abs$spearman,NA)
+  data_abs$nmi2<-ifelse(bool$nmi==T,data_abs$nmi,NA)
+  data_abs$bicor2<-ifelse(bool$bicor==T,data_abs$bicor,NA)
+  score$weight<-rowMeans(data_abs[,c(7,8,9,10)], na.rm=T)
+
+  score$weight<-score$weight*score$sign
+  
+  g<-graph_from_data_frame(score[,c(1,2,8)],directed=F)
+  E(g)$abs<-abs(E(g)$weight)
+  E(g)$inverted<-1-E(g)$abs
+  return(g)
+}
+```
+
+```{r}
+first_les_graph<-create_graph(first_opt_les$score,first_opt_les$bool)
+first_Nles_graph<-create_graph(first_opt_Nles$score,first_opt_Nles$bool)
+```
+
+### 2.3 NETWORK CONTROL
+
+```{r}
+from_network_to_auc<-function(network,GS){
+  interactions<-data.frame(get.edgelist(network))
+  interactions$weight<-(E(network)$weight)
+  colnames(interactions)<-c("gene1","gene2","weight")
+  converted<-id_conversion(interactions)
+  
+  converted<-converted[order(as.character(converted$String1,converted$String2)),] %>% unite("rel", String1:String2, na.rm = TRUE, remove = FALSE)
+
+  converted$diagnostic<-converted$rel %in% GS$rel
+  converted$rel<-NULL
+  return(roc(converted$diagnostic,abs(converted$weight)))
+}
+```
+
+```{r}
+summary_net<-function(les,Nles,GS){
+  summary_data<-data.frame("nodes"=c(length(V(les)),length(V(Nles))),"edges"=c(length(E(les)),length(E(Nles))),"auc"=c(auc(from_network_to_auc(les,GS)),auc(from_network_to_auc(Nles,GS))))
+  rownames(summary_data)<-c("Les","Nles")
+  return(summary_data)
+}
+```
+
+
+```{r warning=FALSE}
+first_summary<-summary_net(first_les_graph,first_Nles_graph,GS)
+```
+
+### 2.4 GREEDY OPTIMIZATION WITH MST
+
+```{r}
+automatic_optimization<-function(g){
+  greedy<-mst(g,weights = E(g)$inverted)
+  return(greedy)
+}
+```
+
+
+```{r}
+second_les_graph<-automatic_optimization(first_les_graph)
+second_Nles_graph<-automatic_optimization(first_Nles_graph)
+```
+
+
+```{r warning=FALSE}
+second_summary<-summary_net(second_les_graph,second_Nles_graph,GS)
+```
+
+### 3.1 HUBS IDENTIFICATION
+
+```{r}
+identify_hub<-function(g){
+  degree<-data.frame("name"=V(g)$name,"degree"=degree(g))
+  th<-boxplot(degree$degree,plot=F)$stats[4,]
+  hub<-degree[degree$degree>th,1]
+  return(hub)
+}
+```
+
+### 3.2 ADD HUBS INTERACTIONS 
+
+```{r}
+add_hub_original_interaction<-function(hubs, first, second,th){
+  first_edges<-igraph::as_data_frame(first,what="edges")
+  hubs_interaction<-first_edges[first_edges$from %in% hubs | first_edges$to %in% hubs,]
+  hubs_interaction_relevant<-hubs_interaction[abs(hubs_interaction$weight)>th,]
+  
+  graph_new<-second
+  for (k in 1:dim(hubs_interaction_relevant)[1]){
+    if (are_adjacent(graph_new,hubs_interaction_relevant[k,1],hubs_interaction_relevant[k,2])==FALSE){
+      graph_new<-graph_new+edge(hubs_interaction_relevant[k,1],hubs_interaction_relevant[k,2],"weight"=hubs_interaction_relevant[k,3])}
+  }
+  
+  return(graph_new)
+}
+```
+
+
+```{r}
+id_conversion2<-function(my_data,sd){
+  n_columns<-(dim(my_data)[2])
+  scores_mapped <- sd$map(my_data, c("gene1"), removeUnmappedRows = TRUE)
+  colnames(scores_mapped)[n_columns+1]<-"String1"
+  scores_mapped <- sd$map(scores_mapped, "gene2", removeUnmappedRows = TRUE)
+  colnames(scores_mapped)[n_columns+2]<-"String2"
+
+  scores_mapped<-scores_mapped[,c(n_columns+1,n_columns+2,3:n_columns)]
+  return(scores_mapped)
+}
+```
+
+```{r}
+convert_and_compare<-function(network,GS,sd){
+  interactions<-data.frame(get.edgelist(network))
+  interactions$weight<-(E(network)$weight)
+  colnames(interactions)<-c("gene1","gene2","weight")
+  converted<-id_conversion2(interactions,sd)
+  
+  converted<-converted[order(as.character(converted$String1,converted$String2)),] %>% unite("rel", String1:String2, na.rm = TRUE, remove = FALSE)
+
+  converted$diagnostic<-converted$rel %in% GS$rel
+  converted$rel<-NULL
+  return(roc(converted$diagnostic,abs(converted$weight)))
+}
+```
+
+```{r}
+best_th_additional<-function(first,second,start,end,bypass,GS){
+  string_db <- STRINGdb$new( version="11", species=9606, score_threshold=0, input_directory="")
+  
+  hub<-identify_hub(second)
+  th<-c()
+  auc_<-c()
+  
+  for (i in seq(from=start, to=end, by=bypass)){
+    new<-add_hub_original_interaction(hub, first, second, i)
+    roc_obj<-convert_and_compare(new,GS,string_db)
+    th<-c(th,i)
+    auc_<-c(auc_,auc(roc_obj))
+  }
+  return(data.frame("th"=th,"auc"=auc_))
+}
+```
+
+```{r warning=FALSE}
+third_les_addition<-best_th_additional(first_les_graph,second_les_graph,0.5,max(abs(E(first_les_graph)$weight)),0.01,GS)
+third_Nles_addition<-best_th_additional(first_Nles_graph,second_Nles_graph,0.5,max(abs(E(first_Nles_graph)$weight)),0.01,GS)
+
+```
+
+### 3.3 COMPARISON 
+```{r}
+comp<-function(addition,second){
+  windows(width=10, height=8)
+  plot(addition[[1]], ylim=c(0.53,0.73),main="Lesional",cex.lab=1.5, cex.axis=1.5, cex.main=1.5,cex=2.5,type="l",lwd=2)
+  abline(h=second[1,3],col="red",lwd=2)
+  legend("topleft", legend="auc without additional interactions", col="red", lwd=1,cex=1.5)
+  windows(width=10, height=8)
+  plot(addition[[2]],ylim=c(0.53,0.68),main="Non-Lesional",cex.lab=1.5, cex.axis=1.5, cex.main=1.5,cex=2.5,type="l",lwd=2)
+  abline(h=second[2,3],col="red",lwd=2)
+  legend("topleft", legend="auc without additional interactions", col="red", lwd=1,cex=1.5)
+  
+  return(list("Les"=addition[[1]][addition[[1]]$auc==max(addition[[1]]$auc),1],"Nles"=addition[[2]][addition[[2]]$auc==max(addition[[2]]$auc),1]))
+}
+```
+
+```{r}
+third_best_th<-comp(list(third_les_addition,third_Nles_addition),second_summary)
+```
+
+```{r}
+
+third_les_graph<-add_hub_original_interaction(identify_hub(second_les_graph),first_les_graph,second_les_graph,third_best_th$Les)
+third_Nles_graph<-add_hub_original_interaction(identify_hub(second_Nles_graph),first_Nles_graph,second_Nles_graph,third_best_th$Nles)
+
+third_summary<-summary_net(third_les_graph,third_Nles_graph,GS)
+
+```
+
+```{r}
+write.csv(identify_hub(third_les_graph),"hub_les")
+```
+
+
+
+### 4.1 NETWORKS AFTER ENSEMBLE STRATEGY
+```{r}
+first_summary
+```
+
+### 4.2 NETWORKS AFTER MST
+
+```{r}
+second_summary
+```
+
+#### 4.3 NETWORKS AFTER ADDING INTERACTIONS TO HUBS
+```{r}
+third_summary
+```
+
+
+### 5 FINAL COMPARISON
+
+
+```{r}
+eng1_AL<-read.table("EngNET1_AL.txt",header=T)
+eng1_NL<-read.table("EngNET1_NL.txt",header=T)
+```
+
+
+```{r}
+log_fitting<-function(net){
+    Freq <- as.data.frame(table(degree(net)))
+    colnames(Freq) <- c("degree", "AF")
+    Freq$degree <- as.numeric(Freq$degree)
+    Freq$RF <- Freq$AF / sum(Freq$AF)
+ 
+    lmDeg <- lm(log(RF) ~ log(degree), data = Freq)
+    return(summary(lmDeg)$adj.r.squared)
+}
+```
+
+
+```{r}
+networks_info<-function(net,GS){
+  r<-log_fitting(net)
+  roc_obj<-from_network_to_auc(net,GS)
+  edg<-length(E(net))
+  vert<-length(V(net))
+  
+  return(list("roc"=roc_obj,"r"=r,"vert"=vert,"edg"=edg))
+}
+```
+
+
+```{r}
+final_validation<-function(score,th,eng1,eng2,GS){
+  
+  kendall<-score[abs(score$kendall)>th$kendall,c(1,2,3)]
+  colnames(kendall)[3]<-"weight"
+  kendall_net<-graph_from_data_frame(kendall,directed=F)
+  info_kendall<-networks_info(kendall_net,GS)
+  
+  spearman<-score[abs(score$spearman)>th$spearman,c(1,2,4)]
+  colnames(spearman)[3]<-"weight"
+  spearman_net<-graph_from_data_frame(spearman,directed=F)
+  info_spearman<-networks_info(spearman_net,GS)
+  
+  nmi<-score[abs(score$nmi)>th$nmi,c(1,2,5)]
+  colnames(nmi)[3]<-"weight"
+  nmi_net<-graph_from_data_frame(nmi,directed=F)
+  info_nmi<-networks_info(nmi_net,GS)
+  
+  bicor<-score[abs(score$bicor)>th$bicor,c(1,2,6)]
+  colnames(bicor)[3]<-"weight"
+  bicor_net<-graph_from_data_frame(bicor,directed=F)
+  info_bicor<-networks_info(bicor_net,GS)
+  
+  colnames(eng1)[3]<-"weight"
+  eng1_net<-graph_from_data_frame(eng1,directed=F)
+  info_eng1<-networks_info(eng1_net,GS)
+  
+  info_eng2<-networks_info(eng2,GS)
+  
+  return(list("kendall"=info_kendall,"spearman"=info_spearman,"nmi"=info_nmi,"bicor"=info_bicor,"eng1"=info_eng1,"eng2"=info_eng2))
+}
+
+
+```
+
+
+```{r}
+result_Lesional<-final_validation(first_lesional_result$score,first_lesional_result$best_th,eng1_AL,third_les_graph,GS)
+result_non_Lesional<-final_validation(first_nonlesional_result$score,first_nonlesional_result$best_th,eng1_NL,third_Nles_graph,GS)
+
+```
+
+```{r}
+print_curves<-function(result){
+  windows(width=10,height=8)
+  par(pty="s")
+  color<-brewer.pal(6,name="Dark2")
+  plot.roc(result$kendall$roc,col=color[1],cex.lab=2,cex.axis=1.5)
+  lines.roc(result$spearman$roc,col=color[2])
+  lines.roc(result$nmi$roc,col=color[3])
+  lines.roc(result$bicor$roc,col=color[4])
+  lines.roc(result$eng1$roc,col=color[5])
+  lines.roc(result$eng2$roc,col=color[6])
+  legend("bottomright", legend=c("kendall","spearman","nmi","bicor","EnGNet1","EnGNet2"), col=color, lwd=2,cex=1.5)
+}
+```
+
+```{r}
+summarize_results<-function(result){
+  first<-c(auc(result$kendall$roc),auc(result$spearman$roc),auc(result$nmi$roc),auc(result$bicor$roc),auc(result$eng1$roc),auc(result$eng2$roc))
+  second<-c(result$kendall$r,result$spearman$r,result$nmi$r,result$bicor$r,result$eng1$r,result$eng2$r)
+  third<-c(result$kendall$vert,result$spearman$vert,result$nmi$vert,result$bicor$vert,result$eng1$vert,result$eng2$vert)
+  fourth<-c(result$kendall$edg,result$spearman$edg,result$nmi$edg,result$bicor$edg,result$eng1$edg,result$eng2$edg)
+ table_final<-data.frame("auc"=first,"fitting_power_law"=second,"nodes"=third,"edges"=fourth)
+ rownames(table_final)<-c("kendall","spearman","nmi","bicor","EnGNet1","EnGNet2")
+ return(table_final)
+}
+```
+
+
+```{r}
+print_curves(result_Lesional)
+print_curves(result_non_Lesional)
+summarize_results(result_Lesional)
+summarize_results(result_non_Lesional)
+
+```
+
+
+```{r}
+write.csv(igraph::as_data_frame(third_les_graph,what="edges")[,c(1:3)],"final_les")
+write.csv(igraph::as_data_frame(third_Nles_graph,what="edges")[,c(1:3)],"final_Nles")
+```
+
+
+```{r}
+library("esquisse")
+cluster<-read.csv("final_les_default_node.csv")
+dimensiona_cluster<-as.data.frame(table(cluster$X__glayCluster))
+c6<-cluster[cluster$X__glayCluster==6,]$name
+write.csv(V(third_les_graph)$name,"lesional_entire")
+
+cluego<-read.table("clueGO_MF_les.txt",sep="\t",header=T)
+cluego<-cluego[order(cluego$Term.PValue.Corrected.with.Bonferroni.step.down),]
+cluego_top10<-cluego[c(1:10),c(3,9)]
+cluego_top10$Term.PValue.Corrected.with.Bonferroni.step.down<-log(cluego_top10$Term.PValue.Corrected.with.Bonferroni.step.dow)
+cluego_top10<-cluego_top10[order(cluego_top10$Term.PValue.Corrected.with.Bonferroni.step.down),]
+
+esquisser()
+
+
+library(ggplot2)
+
+ggplot(cluego_top10) +
+ aes(x = GOTerm, weight = Term.PValue.Corrected.with.Bonferroni.step.down) +
+ geom_bar(fill = "blue") +
+ scale_y_continuous(trans = "asn") +
+ labs(y = "Terms Log P-value", title = "Molecular Functions") +
+ coord_flip() +
+ theme_minimal() +
+ theme(plot.title = element_text(hjust = 0.5)) +
+ ylim(0L, -18L)
+
+```
+
+```{r}
+write.csv(first_lesional_result$score,"lesional_scores")
+write.csv(first_nonlesional_result$score,"non_lesional_scores")
+write.csv(first_lesional_result$best_th,"th_lesional")
+write.csv(first_nonlesional_result$best_th,"th_non_lesional")
+GS<-first_lesional_result$GS
+write.csv(GS,"GS")
+
+```
+
+
