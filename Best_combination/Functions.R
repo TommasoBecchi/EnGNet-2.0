@@ -1,7 +1,6 @@
 
 kdmTopwm<-function(motifs,nmat=1,nflank=5,base=2,alpha=1e-6,cutoff=2,bkg=c(0.25,0.25,0.25,0.25),pseudo=1,um=TRUE,fraction=0.9,estimate=TRUE,threshold=0){
         map<-list()
-        map[["a"]]<-c(1,0,0,0)
         map[["c"]]<-c(0,1,0,0)
         map[["g"]]<-c(0,0,1,0)
         map[["t"]]<-c(0,0,0,1)
